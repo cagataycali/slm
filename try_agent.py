@@ -8,6 +8,8 @@ Run:  BYPASS_TOOL_CONSENT=true .venv/bin/python try_agent.py
     you> /ask what is the name of the maintenance robot on deck 12?  # knows — from WEIGHTS
     you> /reset                                                      # off-switch
 
+Weights auto-load from /tmp/slm_try_agent.pt on start and auto-save on exit.
+
 Commands: /ask <q> (weights-only answer) · /teach <prompt> | <response> ·
 /observe <text> · /surprise · /auto (toggle per-turn curation) ·\n/save · /load · /reset · /quit.
 Anything else is a normal agent turn (shell tool) — it learns from the transcript.
@@ -79,4 +81,5 @@ while True:
             m.teach(q, str(reply).strip(), epochs=1)
         print(f"[learned: ||B|| {before:.4f} -> {norm():.4f}]")
 
-print("bye — weights not saved unless you used /save")
+m.save_fast_weights(CKPT)
+print(f"bye — weights auto-saved to {CKPT}")

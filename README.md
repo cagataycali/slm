@@ -20,7 +20,7 @@ with a plastic layer that keeps learning at inference — with a provable off-sw
 pip install strands-slm
 ```
 
-**Contents:** [Quickstart](#quickstart) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
+**Contents:** [Quickstart](#quickstart) · [Supported models](#supported-models) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
 
 ## Quickstart
 
@@ -49,6 +49,27 @@ for doc in your_stream:
     m.observe(doc, learn=True)   # predicts; if surprised, rewrites its fast weights
 m.reset()                        # bit-exact back to the base
 ```
+
+## Supported models
+
+Any HF causal-LM (or PEFT adapter repo) works — the plastic layer attaches
+generically. Validated end to end:
+
+| model | params | notes |
+|---|---|---|
+| [`cagataydev/strands-qwen3-vl-2b`](https://huggingface.co/cagataydev/strands-qwen3-vl-2b) | 2B | **default** — Qwen3-VL-2B post-tuned on the strands-agents codebase (vision included) |
+| [`cagataydev/strands-gemma4-e2b`](https://huggingface.co/cagataydev/strands-gemma4-e2b) | e2b | Gemma 4 QAT adapter repo — int8 layers dequantized so the plastic LoRA attaches |
+| [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | 0.6B | smallest validated; pass `enable_thinking=False` to skip chain-of-thought |
+
+```python
+SLM("cagataydev/strands-qwen3-vl-2b")               # strands expert (default)
+SLM("cagataydev/strands-gemma4-e2b")                # gemma family
+SLM("Qwen/Qwen3-0.6B", enable_thinking=False)       # tiny + fast
+```
+
+Per family, the loader auto-detects: assistant-span regex for the chat
+template, tool-role support (folds tool results into user turns when the
+template drops them), PEFT adapter merging, and QAT dequantization.
 
 **See it happen: [demo.ipynb](demo.ipynb)**
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cagataycali/slm/blob/main/demo.ipynb)

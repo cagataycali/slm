@@ -31,5 +31,8 @@ def __getattr__(name):
         return slm_tools
     raise AttributeError(f"module 'slm' has no attribute {name!r}")
 
-__version__ = "0.2.1"
+try:
+    from ._version import version as __version__
+except ImportError:  # not installed / no scm metadata
+    __version__ = "0.0.0+unknown"
 __all__ = ["StrandsPlasticQwen", "SLM", "slm_tools", "DEFAULT_MODEL", "__version__"]

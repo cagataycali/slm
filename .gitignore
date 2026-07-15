@@ -9,3 +9,4 @@ scripts/corpus_raw/
 scripts/corpus.jsonl
 *.pt
 .DS_Store
+slm/_version.py

@@ -16,18 +16,16 @@ import os
 os.environ.setdefault("BYPASS_TOOL_CONSENT", "true")
 
 from strands import Agent
-from strands.tools.registry import ToolRegistry
 from strands_tools import shell
 from slm import SLM
 
 SYSTEM = "You are a helpful assistant with shell access. Be brief."
 CKPT = "/tmp/slm_try_agent.pt"
-registry = ToolRegistry()
-registry.process_tools([shell])
-TOOL_SPECS = registry.get_all_tool_specs()
 
 print("loading model (plasticity=high, deep placement)...")
 m = SLM(plasticity="high", placement="deep", max_tokens=256, replay_k=2)
+agent = Agent(model=m, tools=[shell], callback_handler=None, system_prompt=SYSTEM)
+TOOL_SPECS = agent.tool_registry.get_all_tool_specs()
 norm = lambda: m._m.head.B.norm().item()
 print(f"ready. ||B||={norm():.4f}\n" + __doc__.split("Commands:")[1])
 
@@ -59,9 +57,10 @@ while True:
         m.load_fast_weights(arg or CKPT); print(f"[load] ||B||={norm():.4f}")
     elif cmd == "/reset":
         m.reset(); print(f"[reset] bit-exact base model. ||B||={norm():.4f}")
-    else:  # agent turn — fresh Agent so answers come from WEIGHTS, not context
+    else:  # agent turn — history cleared each turn so answers come from WEIGHTS
+        agent.messages = []
         before = norm()
-        print(f"\nagent> {Agent(model=m, tools=[shell], callback_handler=None, system_prompt=SYSTEM)(q)}")
+        print(f"\nagent> {agent(q)}")
         print(f"[learned: ||B|| {before:.4f} -> {norm():.4f}]")
 
 print("bye — weights not saved unless you used /save")

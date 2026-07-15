@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "strands-slm"
-version = "0.2.1"
+version = "0.2.2"
 description = "Self-learning model: a Strands-Agents-expert Qwen3-VL-2B whose weights keep changing at inference — surprise-gated, bounded, with a provable off-switch."
 readme = "README.md"
 requires-python = ">=3.9"

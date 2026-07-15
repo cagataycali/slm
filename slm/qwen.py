@@ -106,8 +106,13 @@ class StrandsPlasticQwen:
 
     def __init__(self, model, tok, head, lr=8e-3, decay=0.98, k_gate=0.0,
                  max_B_norm=None, neuromod=False, prompt_loss_weight=0.1):
+        import threading
         import torch
         self.model, self.tok, self.head = model, tok, head
+        # QA-17: concurrent observe() from OS threads corrupts the native
+        # heap (interleaved backward/step). RLock serializes the learn path;
+        # re-entrant so wrapped observes (deep decay) stay single-lock.
+        self.learn_lock = threading.RLock()
         # keep the END of long documents (assistant answer lives there)
         self.tok.truncation_side = "left"
         self.opt = torch.optim.SGD([head.A, head.B], lr=lr)
@@ -272,7 +277,7 @@ class StrandsPlasticQwen:
         return 1.0 / (1.0 + math.exp(-z))
 
     def observe(self, text, learn=True, max_length=2048, update_gate_stats=True,
-                prompt_weight=None):
+                prompt_weight=None, force_fire=False):
         """Predict `text`; if surprised, rewrite the fast weights (bounded).
 
         single forward — the surprise NLL and the training loss share
@@ -280,7 +285,18 @@ class StrandsPlasticQwen:
         pass update_gate_stats=False for rehearsal/replay so old, easy
         documents do not drag the EMA surprise mean down.
 
+        Thread-safety (QA-17): the whole predict→gate→update sequence holds
+        self.learn_lock — concurrent OS-thread observes corrupted the
+        native heap (interleaved backward/step on shared params).
+
         Returns the pre-update NLL (the surprise)."""
+        with self.learn_lock:
+            return self._observe_locked(text, learn, max_length,
+                                        update_gate_stats, prompt_weight,
+                                        force_fire)
+
+    def _observe_locked(self, text, learn, max_length, update_gate_stats,
+                        prompt_weight, force_fire):
         import torch
         enc = self.tok(text, return_tensors="pt", truncation=True,
                        max_length=max_length, return_offsets_mapping=True)
@@ -303,7 +319,11 @@ class StrandsPlasticQwen:
             with torch.no_grad():
                 e = self._nll(ids, weights).item()
 
-        fire = (self.mean is None) or (e > self.mean + self.k_gate * abs(self.mean))
+        # amb_E20b fix: curated channel (teach/revise) must bypass the gate —
+        # repeated exposures of the same lesson fall below the EMA and the
+        # gate starves legitimate curated learning (recall 0/8 at k_gate=0).
+        fire = force_fire or (self.mean is None) or (
+            e > self.mean + self.k_gate * abs(self.mean))
         if update_gate_stats:
             if self.mean is None:
                 self.mean, self.var = e, 0.0

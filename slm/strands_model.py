@@ -54,6 +54,13 @@ class SLM(Model):
                  token: Optional[str] = None, **kwargs):
         from .qwen import StrandsPlasticQwen
         lr, decay, r_fast, k_gate = PLASTICITY[plasticity]
+        # amb_E18 fix: honor explicit overrides — previously SLM(k_gate=...)
+        # (and lr/decay) were silently swallowed by **kwargs, so callers got
+        # the preset value without warning.
+        lr = kwargs.pop("lr", lr)
+        decay = kwargs.pop("decay", decay)
+        k_gate = kwargs.pop("k_gate", k_gate)
+        r_fast = kwargs.pop("r_fast", r_fast)
         self._m = StrandsPlasticQwen.from_pretrained(
             model_id, device=device, r_fast=r_fast, lr=lr, decay=decay,
             k_gate=k_gate, token=token,
@@ -97,6 +104,10 @@ class SLM(Model):
 
     async def structured_output(self, output_model, prompt, system_prompt=None, **kwargs):
         raise NotImplementedError("SLM does not support structured output yet")
+        # unreachable yield makes this an async GENERATOR: strands drives it
+        # with `async for`, so a plain coroutine raised a cryptic TypeError
+        # ("requires __aiter__") instead of the NotImplementedError (QA-19)
+        yield
 
     async def stream(self, messages: Messages,
                      tool_specs: Optional[list[ToolSpec]] = None,
@@ -107,15 +118,20 @@ class SLM(Model):
         import torch
 
         chat = self._to_chat(messages, system_prompt, tool_specs)
-        try:
-            ids = self._m.tok.apply_chat_template(
-                chat, add_generation_prompt=True, return_tensors="pt",
-                tools=self._tools_for_template(tool_specs), **self._tmpl_kw())
-        except Exception:
-            # some templates reject the tools= kwarg — degrade gracefully
-            ids = self._m.tok.apply_chat_template(
-                chat, add_generation_prompt=True, return_tensors="pt",
-                **self._tmpl_kw())
+        # QA-18: the HF fast tokenizer (Rust) is NOT thread-safe — concurrent
+        # use from the event loop and a direct-API thread raises
+        # RuntimeError('Already borrowed'). All tokenizer touches in stream()
+        # hold the same RLock as the learn path.
+        with self._m.learn_lock:
+            try:
+                ids = self._m.tok.apply_chat_template(
+                    chat, add_generation_prompt=True, return_tensors="pt",
+                    tools=self._tools_for_template(tool_specs), **self._tmpl_kw())
+            except Exception:
+                # some templates reject the tools= kwarg — degrade gracefully
+                ids = self._m.tok.apply_chat_template(
+                    chat, add_generation_prompt=True, return_tensors="pt",
+                    **self._tmpl_kw())
         if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
             ids = ids["input_ids"]
         ids = ids.to(self._m.device)
@@ -123,7 +139,9 @@ class SLM(Model):
         temp = float(self.config.get("temperature", 0.0))
 
         def _generate():
-            with torch.no_grad():
+            # runs in a worker thread: hold the learn RLock so generation
+            # never overlaps a direct-API thread's backward/step (QA-18)
+            with self._m.learn_lock, torch.no_grad():
                 return self._m.model.generate(
                     input_ids=ids,
                     max_new_tokens=int(self.config.get("max_tokens", 1024)),
@@ -141,7 +159,9 @@ class SLM(Model):
         async with self._learn_lock:
             out = await asyncio.to_thread(_generate)
         _latency_ms = int((time.time() - _t_gen) * 1000)
-        text = self._m.tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+        with self._m.learn_lock:      # fast tokenizer: not thread-safe (QA-18)
+            text = self._m.tok.decode(out[0, ids.shape[1]:],
+                                      skip_special_tokens=True)
 
         tool_use = self._parse_tool_call(text)
 
@@ -244,6 +264,16 @@ class SLM(Model):
                     if self._entry_kind(d) != "curated":
                         del self.replay_buffer[i]
                         break
+                else:
+                    # all-curated buffer: nothing evictable — the curated tier
+                    # grows past the cap by design (never evicted), but
+                    # consolidate() cost now grows with every teach()
+                    logger.warning(
+                        "replay buffer: %d curated lessons exceed replay_cap="
+                        "%d — curated entries are never evicted, so the "
+                        "buffer (and consolidate() cost) will keep growing. "
+                        "Raise replay_cap or prune via supersession.",
+                        len(self.replay_buffer), self.replay_cap)
             return e
         # raw tier reservoir
         self._buffer_seen += 1
@@ -312,19 +342,25 @@ class SLM(Model):
         _orig_observe = self._m.observe
 
         def observe_with_deep_decay(text, learn=True, max_length=2048,
-                                    update_gate_stats=True, prompt_weight=None):
+                                    update_gate_stats=True, prompt_weight=None,
+                                    force_fire=False):
             import torch as _t
-            e = _orig_observe(text, learn=learn, max_length=max_length,
-                              update_gate_stats=update_gate_stats,
-                              prompt_weight=prompt_weight)
-            # decay deep B only when the gate actually fired — the
-            # same condition under which the head B decays. Previously deep
-            # knowledge decayed on every learn=True call, so it faded faster
-            # than head knowledge in low-plasticity mode.
-            if learn and self._m.last_fired:
-                with _t.no_grad():
-                    for p in self._deep_params[1::2]:
-                        p.mul_(self._deep_decay)
+            # QA-17: hold the (re-entrant) learn lock across observe AND the
+            # deep decay — decaying outside it raced with another thread's
+            # backward/step on the same deep params.
+            with self._m.learn_lock:
+                e = _orig_observe(text, learn=learn, max_length=max_length,
+                                  update_gate_stats=update_gate_stats,
+                                  prompt_weight=prompt_weight,
+                                  force_fire=force_fire)
+                # decay deep B only when the gate actually fired — the
+                # same condition under which the head B decays. Previously deep
+                # knowledge decayed on every learn=True call, so it faded faster
+                # than head knowledge in low-plasticity mode.
+                if learn and self._m.last_fired:
+                    with _t.no_grad():
+                        for p in self._deep_params[1::2]:
+                            p.mul_(self._deep_decay)
             return e
 
         self._m.observe = observe_with_deep_decay
@@ -352,8 +388,9 @@ class SLM(Model):
         chat = [{"role": "user", "content": prompt},
                 {"role": "assistant", "content": response}]
         try:
-            doc = self._m.tok.apply_chat_template(chat, tokenize=False,
-                                                  **self._tmpl_kw())
+            with self._m.learn_lock:   # fast tokenizer: not thread-safe (QA-18)
+                doc = self._m.tok.apply_chat_template(chat, tokenize=False,
+                                                      **self._tmpl_kw())
         except Exception:
             doc = f"user: {prompt}\nassistant: {response}"
         # SUPERSESSION (C38): drop stale buffer lessons for the same prompt
@@ -373,7 +410,7 @@ class SLM(Model):
             # prompt_weight=1.0: curated bindings need FULL prompt-familiarity
             # (weighted loss alone regressed fact recall T6 to 4/8)
             e = self._m.observe(doc, learn=True, update_gate_stats=(i == 0),
-                                prompt_weight=1.0)
+                                prompt_weight=1.0, force_fire=True)
         self._buffer_add(doc, kind="curated", prompt=pk, response=rk,
                          source="teach")
         return e
@@ -639,10 +676,15 @@ class SLM(Model):
                 # sleep burns tool output/boilerplate (and any injected text)
                 # at 1.0 for epochs x buffer updates, re-opening the wake-time
                 # poisoning damping.
+                # amb_E20b fix: sleep replay of CURATED lessons bypasses the
+                # gate (force_fire) — rehearsed lessons are low-surprise by
+                # design, so a k>=0 gate silently skipped them and sleep did
+                # not consolidate (gated recall stuck at 3/8).
                 es = [self._m.observe(
                           self._entry_text(d), learn=True,
                           update_gate_stats=False,
-                          prompt_weight=1.0 if self._entry_kind(d) == "curated" else None)
+                          prompt_weight=1.0 if self._entry_kind(d) == "curated" else None,
+                          force_fire=self._entry_kind(d) == "curated")
                       for d in docs]
                 es = [e for e in es if e is not None]
                 last = sum(es) / max(len(es), 1)
@@ -677,14 +719,27 @@ class SLM(Model):
             logger.warning(
                 "save_fast_weights: replay buffer (verbatim transcripts) is "
                 "included — use include_transcripts=False before publishing.")
-        torch.save({"A": self._m.head.A.detach().cpu(),
-                    "B": self._m.head.B.detach().cpu(),
-                    "deep": [p.detach().cpu() for p in self._deep_params],
-                    "turn_count": self.turn_count,
-                    "plasticity": self.plasticity,
-                    "placement": self.placement,
-                    "replay_buffer": list(self.replay_buffer)
-                                     if include_transcripts else []}, path)
+        # QA-28: atomic write. torch.save truncates in place, so a crash /
+        # disk-full mid-write destroyed the previous checkpoint at the same
+        # path (agents overwrite one path every save). Write to a temp file
+        # in the same directory, then os.replace (atomic on POSIX).
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            torch.save({"A": self._m.head.A.detach().cpu(),
+                        "B": self._m.head.B.detach().cpu(),
+                        "deep": [p.detach().cpu() for p in self._deep_params],
+                        "turn_count": self.turn_count,
+                        "plasticity": self.plasticity,
+                        "placement": self.placement,
+                        "replay_buffer": list(self.replay_buffer)
+                                         if include_transcripts else []}, tmp)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def load_experience_from_hf(self, repo: str = "cagataydev/self-learning-model",
                                 filename: str = "slm_agent/marathon_experience.pt",
@@ -806,6 +861,12 @@ class SLM(Model):
                         pA.copy_(A.to(pA.dtype).to(pA.device))
                         pB.copy_(B.to(pB.dtype).to(pB.device))
         elif strategy == "relearn":
+            # amb_E17/E17b finding: 3 plain observe passes UNDER-TRAIN the
+            # merged lessons (0/6 recall). The proven recipe is the teach()
+            # path itself: 4 shuffled passes x epochs=2 (chat-template render
+            # + supersession + prompt_weight=1.0) then consolidate(3) — this
+            # restored 6/6 recall with the conflict cleanly resolved
+            # (last-writer-wins by shuffle order for conflicting prompts).
             self.reset()
             lessons = []
             for c in ckpts:
@@ -813,12 +874,21 @@ class SLM(Model):
             lessons = [d if isinstance(d, dict)
                        else self._entry(d, "raw", source="legacy")
                        for d in lessons]
-            random.Random(0).shuffle(lessons)
-            for _ in range(3):
-                for d in lessons:
-                    self._m.observe(
-                        d["text"], learn=True, update_gate_stats=False,
-                        prompt_weight=1.0 if d.get("kind") == "curated" else None)
+            rng = random.Random(0)
+            for _ in range(4):
+                order = list(lessons)
+                rng.shuffle(order)
+                for d in order:
+                    if d.get("prompt") and d.get("response") is not None:
+                        self.teach(d["prompt"], d["response"], epochs=2)
+                    else:
+                        for _e in range(2):
+                            self._m.observe(
+                                d["text"], learn=True,
+                                update_gate_stats=False,
+                                prompt_weight=(1.0 if d.get("kind") == "curated"
+                                               else None))
+            self.consolidate(epochs=3)
             self.replay_buffer = lessons[-self.replay_cap:]
         else:
             raise ValueError(f"unknown strategy: {strategy}")
@@ -1031,7 +1101,8 @@ class SLM(Model):
                 chat.append({"role": msg["role"], "content": text})
         chat.append({"role": "assistant", "content": reply})
         try:
-            return self._m.tok.apply_chat_template(chat, tokenize=False,
-                                                   **self._tmpl_kw())
+            with self._m.learn_lock:   # fast tokenizer: not thread-safe (QA-18)
+                return self._m.tok.apply_chat_template(chat, tokenize=False,
+                                                       **self._tmpl_kw())
         except Exception:
             return "\n".join(f"{c['role']}: {c['content']}" for c in chat)

@@ -14,7 +14,7 @@ with a plastic layer that keeps learning at inference — with a provable off-sw
 
 > **For** agent builders and continual-learning researchers who want a model that
 > adapts *after* deployment. **Runs on** one GPU (validated on an L40S; CPU works
-> for smoke tests). ~1.6M plastic params over a frozen 2.13B base.
+> for smoke tests). ~21M plastic params (~1%) over a frozen 2.13B base.
 
 ```bash
 pip install strands-slm
@@ -116,7 +116,7 @@ template drops them), PEFT adapter merging, and QAT dequantization.
 ```
 frozen Qwen3-VL-2B            instinct — never updated, cannot forget
   + strands LoRA (merged)     slow: post-tuned strands-agents expertise
-  + plastic LoRA              fast: ~1.6M params over the frozen 2.13B,
+  + plastic LoRA              fast: ~21M params (~1%) over the frozen 2.13B,
                               updated on every observation at inference
   + surprise gate             learn only when prediction error spikes
   + EMA decay                 bounded plasticity — learns AND retains
@@ -135,7 +135,7 @@ Measured on a single GPU, seed-replicated. The base model is never updated.
 | Does not forget | strands expertise after OOD learning: Δ −0.01 |
 | Agent competence grows | held-out tasks 0/4 → 4/4 after 18 curated lessons, 5/5 seeds |
 | Fact memory | 15/15 facts at 100% verbatim recall |
-| Fleet learning | two agents' experience files summed losslessly |
+| Fleet merge (arithmetic) | exact delta composition (rel. err 1e-7 vs ~1.0 for naive factor-sum); **skill transfer after merging is NOT guaranteed** — see caveat below |
 | Persistence | experience survives process death bit-exact |
 | Provable off-switch | `reset()` is bit-identical to the base, Δlogits = 0 |
 | Cost | +0.11–0.25 s/turn learning overhead |
@@ -162,7 +162,7 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
 | `.consolidate(epochs=5)` | sleep phase: replay the lesson buffer, harden weak memories |
 | `.revise(prompt, old, new)` | targeted unlearning: flip a consolidated belief |
 | `.save_fast_weights(path)` / `.load_fast_weights(path)` | persist or restore acquired experience |
-| `.merge_experience(paths)` | fleet learning: compose multiple agents' experience files |
+| `.merge_experience(paths)` | compose agents' experience files. **Caveat (measured):** the delta arithmetic is exact and conflict detection works, but merged fact bindings from same-format experience can fail to transfer — the merged deltas are parameter-orthogonal yet the composed model may babble. Verify recall after merging; prefer `strategy="relearn"` + re-teaching for critical lessons |
 | `.reset()` | the off-switch — exactly the base model again |
 | `.surprise_log` | (turn, NLL) history — watch it learn |
 | `.audit_log` | per-update content hash + provenance — attribute any poisoned update |
@@ -208,7 +208,18 @@ Full reference with parameters and examples: **[docs/api.md](docs/api.md)** · s
   appear in the model's wrong prior answer, or you get a false positive.
 - Freshly-bound facts can smear at minimal binding strength (right key
   token, loose frame) — a couple of extra teach rounds tightens it.
+- **Merging is exact arithmetic, not guaranteed skill composition** — E7c
+  (see `experiments/`): two agents' bind-trained deltas were near-orthogonal
+  in parameter space, yet the SUM-merged model recalled 0/6 facts and emitted
+  repetition loops. Verify recall after any merge.
+- Replay protects lessons at a measured cost to general retention
+  (+0.59 vs +0.16 NLL under a 12-doc interference stream) — two-tier replay
+  chooses lesson retention; tune `replay_k` to your priorities.
 - All findings are at 0.6B–2B scale; scaling behavior is unknown.
+
+A full experimental treatment (ablations, negative results, cross-family
+replication, latency) is in the paper draft under `paper/` with logs in
+`experiments/`.
 
 ## Reproduce the post-tune
 

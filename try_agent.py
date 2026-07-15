@@ -56,7 +56,11 @@ while True:
         ok = m.bind(prompt, response, system_prompt=SYSTEM, tool_specs=TOOL_SPECS)
         print(f"[teach] {'learned — verify with /ask' if ok else 'stuck after max rounds — retry or pass a distinctive key'}: {prompt!r}")
     elif cmd == "/observe":
-        print(f"[observe] surprise={m.observe(arg):.3f}  ||B||={norm():.4f}")
+        e = m.observe(arg)
+        if e is None:   # too short to predict (<2 tokens) — nothing learned
+            print(f"[observe] text too short to learn from  ||B||={norm():.4f}")
+        else:
+            print(f"[observe] surprise={e:.3f}  ||B||={norm():.4f}")
     elif cmd == "/surprise":
         for t, e in m.surprise_log[-15:] or [(0, float('nan'))]:
             print(f"  turn {t:3d}: surprise={e:.3f}")

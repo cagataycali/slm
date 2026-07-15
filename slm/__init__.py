@@ -28,5 +28,5 @@ def __getattr__(name):
         return SLM
     raise AttributeError(f"module 'slm' has no attribute {name!r}")
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["StrandsPlasticQwen", "SLM", "DEFAULT_MODEL", "__version__"]

@@ -66,14 +66,15 @@ def _dequantize_qat(model):
     for _, mod in list(model.named_modules()):
         for child_name, child in list(mod.named_children()):
             if type(child).__name__ == "QuantizedLinear":
-                W = child._dequantize_weights(torch.float32).to(dtype)
+                W32 = child._dequantize_weights(torch.float32)
+                W = W32.to(dtype)
                 lin = nn.Linear(child.in_features, child.out_features,
                                 bias=child.bias is not None, dtype=dtype)
                 with torch.no_grad():
                     lin.weight.copy_(W)
                     if child.bias is not None:
                         lin.bias.copy_(child.bias.to(dtype))
-                lin = lin.to(child._dequantize_weights(torch.float32).device)
+                lin = lin.to(W32.device)
                 setattr(mod, child_name, lin)
                 n += 1
     return n
@@ -217,25 +218,48 @@ class StrandsPlasticQwen:
         w = weights[:, 1:].reshape(-1).to(ce.dtype).to(ce.device)
         return (ce * w).sum() / w.sum().clamp(min=1e-6)
 
-    def _assistant_labels(self, ids, offsets, text):
-        """completion-weighted labels. Assistant-span tokens get
-        weight 1.0; everything else gets prompt_loss_weight (default 0.1).
-        Returns None when the text has no chat-template markers."""
+    def _assistant_labels(self, ids, offsets, text, prompt_weight=None):
+        """completion-weighted labels. The FINAL assistant span's tokens get
+        weight 1.0; everything else (prompt, boilerplate, and the model's OWN
+        earlier replies in the sliding window) gets prompt_loss_weight.
+        Returns None when the text has no chat-template markers.
+
+        prompt_weight overrides self.prompt_loss_weight for this call only
+        (passed through instead of mutating shared state — concurrent turns
+        raced on the old temp mutation).
+
+        Earlier assistant spans are DAMPED, not full-weight: the transcript
+        window re-presents each of the model's replies on several subsequent
+        turns, and re-learning them at 1.0 amplified self-training."""
         import torch
+        pw = self.prompt_loss_weight if prompt_weight is None else prompt_weight
         spans = [m.span(1) for m in self.assistant_re.finditer(text)]
         if not spans:
             return None
+        full_spans = spans[-1:]              # only the newest reply learns fully
         keep = torch.zeros(ids.shape[1], dtype=torch.bool)
-        for i, (s, e) in enumerate(offsets.tolist()):
+        off = offsets.tolist()
+        for i, (s, e) in enumerate(off):
             if s == e:                       # special token
                 continue
-            for (as_, ae) in spans:
-                if s < ae and e > as_:       # overlap with assistant span
+            for (as_, ae) in full_spans:
+                if s < ae and e > as_:       # overlap with final assistant span
                     keep[i] = True
                     break
         if keep.sum() < 2:                   # nothing learnable -> no mask
             return None
-        weights = torch.full((1, ids.shape[1]), float(self.prompt_loss_weight))
+        # the terminator special token right after the span also learns at
+        # full weight — otherwise the model under-learns WHEN TO STOP and
+        # rambles after learned responses.
+        idxs = keep.nonzero().flatten().tolist()
+        j = idxs[-1] + 1
+        if j < ids.shape[1]:
+            tid = int(ids[0, j])
+            special = (off[j][0] == off[j][1]
+                       or tid in getattr(self.tok, "all_special_ids", []))
+            if special:
+                keep[j] = True
+        weights = torch.full((1, ids.shape[1]), float(pw))
         weights[0, keep] = 1.0
         return weights
 
@@ -269,11 +293,8 @@ class StrandsPlasticQwen:
         if prompt_weight is not None and prompt_weight >= 1.0:
             weights = None
         else:
-            _saved = self.prompt_loss_weight
-            if prompt_weight is not None:
-                self.prompt_loss_weight = prompt_weight
-            weights = self._assistant_labels(ids, enc.offset_mapping[0], text)
-            self.prompt_loss_weight = _saved
+            weights = self._assistant_labels(ids, enc.offset_mapping[0], text,
+                                             prompt_weight=prompt_weight)
 
         if learn:
             loss = self._nll(ids, weights)               # one forward, with graph

@@ -15,10 +15,12 @@ Mechanism (validated in README.md / demo.ipynb):
   reset() -> bit-identical to base. save/load fast weights for persistence.
 
 """
+import hashlib
 import json
 import logging
 import os
 import random
+import time
 from typing import Any, AsyncIterable, Optional
 
 from strands.types.content import Messages
@@ -82,7 +84,9 @@ class SLM(Model):
         self.replay_buffer = []         # past turn transcripts (for rehearsal)
         self.replay_k = int(kwargs.get("replay_k", 3))
         self.replay_cap = int(kwargs.get("replay_cap", 64))
-        self._buffer_seen = 0           # reservoir-sampling counter
+        self._buffer_seen = 0           # reservoir-sampling counter (raw tier)
+        self.audit_log = []             # SEC-1: {turn, nll, sha256, source}
+        self._learn_lock = None         # concurrency guard (lazy asyncio.Lock)
 
     # ---------- strands Model interface ----------
     def update_config(self, **model_config: Any) -> None:
@@ -127,8 +131,16 @@ class SLM(Model):
                     repetition_penalty=float(self.config.get("repetition_penalty", 1.1)),
                     pad_token_id=self._m.tok.eos_token_id)
 
+        # serialize generate+learn across concurrent turns — the optimizer,
+        # backward graph and plastic A/B are shared mutable state.
+        if self._learn_lock is None:
+            self._learn_lock = asyncio.Lock()
+
         # keep the event loop responsive
-        out = await asyncio.to_thread(_generate)
+        _t_gen = time.time()
+        async with self._learn_lock:
+            out = await asyncio.to_thread(_generate)
+        _latency_ms = int((time.time() - _t_gen) * 1000)
         text = self._m.tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
 
         tool_use = self._parse_tool_call(text)
@@ -150,7 +162,7 @@ class SLM(Model):
             "inputTokens": int(ids.shape[1]),
             "outputTokens": int(out.shape[1] - ids.shape[1]),
             "totalTokens": int(out.shape[1])},
-            "metrics": {"latencyMs": 0}}}
+            "metrics": {"latencyMs": _latency_ms}}}
 
         # ---- THE POINT: learn from this turn (with replay rehearsal) ----
         if self.learn_on_turn:
@@ -167,30 +179,85 @@ class SLM(Model):
                         for past in random.sample(
                                 self.replay_buffer,
                                 min(self.replay_k, len(self.replay_buffer))):
-                            self._m.observe(past, learn=True,
-                                            update_gate_stats=False)
+                            self._m.observe(
+                                self._entry_text(past), learn=True,
+                                update_gate_stats=False,
+                                prompt_weight=1.0 if self._entry_kind(past) == "curated" else None)
                 return e
 
-            # backward passes off the event loop
-            e = await asyncio.to_thread(_learn)
-            self._buffer_add(transcript)
+            # backward passes off the event loop (serialized with generation)
+            async with self._learn_lock:
+                e = await asyncio.to_thread(_learn)
+            self._buffer_add(transcript, kind="raw", source="turn")
             self.turn_count += 1
             if e is not None:
                 self.surprise_log.append((self.turn_count, e))
+                # SEC-1 audit: content hash + source so a poisoned update can
+                # be attributed (and its buffer entry located) after the fact
+                self.audit_log.append({
+                    "turn": self.turn_count, "nll": e,
+                    "sha256": hashlib.sha256(transcript.encode()).hexdigest(),
+                    "source": "turn"})
                 logger.debug("SLM turn %d: surprise %.3f (weights updated)",
                              self.turn_count, e)
 
-    def _buffer_add(self, doc: str):
-        """reservoir sampling past capacity — every lesson ever seen
-        has equal probability of remaining, instead of FIFO evicting the
-        oldest (and often most foundational) lessons."""
+    @staticmethod
+    def _entry(text: str, kind: str = "raw", prompt=None, response=None,
+               source: str = "turn") -> dict:
+        """Structured buffer entry: content hash + provenance for audit,
+        exact prompt/response fields for supersession, kind for typed replay."""
+        return {"text": text, "kind": kind, "prompt": prompt,
+                "response": response,
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "source": source, "ts": time.time()}
+
+    @staticmethod
+    def _entry_text(d) -> str:
+        return d["text"] if isinstance(d, dict) else d
+
+    @staticmethod
+    def _entry_kind(d) -> str:
+        return d.get("kind", "raw") if isinstance(d, dict) else "raw"
+
+    def _buffer_add(self, doc, kind: str = "raw", prompt=None, response=None,
+                    source: str = "turn"):
+        """Two-tier buffer.
+
+        curated tier — guaranteed insertion, NEVER reservoir-evicted (a lesson
+        curated via teach() at turn 1000 previously had a cap/seen chance of
+        surviving); removed only by supersession/revise.
+        raw tier — reservoir sampling over the raw slots, so every raw turn
+        ever seen keeps equal survival probability.
+
+        Deduplicates by content hash (tool-call turns re-appear inside the
+        next turn's sliding window — no point double-buffering them)."""
+        e = (self._entry(doc, kind, prompt, response, source)
+             if isinstance(doc, str) else doc)
+        if any(isinstance(d, dict) and d["sha256"] == e["sha256"]
+               for d in self.replay_buffer):
+            return e
+        if e["kind"] == "curated":
+            self.replay_buffer.append(e)
+            if len(self.replay_buffer) > self.replay_cap:
+                # over cap: evict the oldest RAW entry, never a curated one
+                for i, d in enumerate(self.replay_buffer):
+                    if self._entry_kind(d) != "curated":
+                        del self.replay_buffer[i]
+                        break
+            return e
+        # raw tier reservoir
         self._buffer_seen += 1
-        if len(self.replay_buffer) < self.replay_cap:
-            self.replay_buffer.append(doc)
+        raw_idx = [i for i, d in enumerate(self.replay_buffer)
+                   if self._entry_kind(d) != "curated"]
+        n_curated = len(self.replay_buffer) - len(raw_idx)
+        raw_cap = max(self.replay_cap - n_curated, 1)
+        if len(raw_idx) < raw_cap:
+            self.replay_buffer.append(e)
         else:
             j = random.randrange(self._buffer_seen)
-            if j < self.replay_cap:
-                self.replay_buffer[j] = doc
+            if j < raw_cap:
+                self.replay_buffer[raw_idx[j]] = e
+        return e
 
     def _inject_deep(self, k_blocks: int, r: int, lr: float, decay: float):
         """Attach plastic LoRA to q_proj/v_proj of the last k attention blocks."""
@@ -292,11 +359,14 @@ class SLM(Model):
         # SUPERSESSION (C38): drop stale buffer lessons for the same prompt
         # with a different response — otherwise replay/consolidate rehearses
         # the old belief and fights the revision.
-        prompt_key = prompt.strip()[:80]
-        self.replay_buffer = [
-            d for d in self.replay_buffer
-            if not (prompt_key in d and response.strip()[:40] not in d)
-        ]
+        pk, rk = prompt.strip(), response.strip()
+
+        def _stale(d):
+            if isinstance(d, dict) and d.get("prompt") is not None:
+                return d["prompt"] == pk and (d.get("response") or "").strip() != rk
+            t = self._entry_text(d)          # legacy string entries
+            return pk[:80] in t and rk[:40] not in t
+        self.replay_buffer = [d for d in self.replay_buffer if not _stale(d)]
         e = None
         for i in range(epochs):
             # repeated epochs on the same doc must not drag the EMA down.
@@ -304,7 +374,8 @@ class SLM(Model):
             # (weighted loss alone regressed fact recall T6 to 4/8)
             e = self._m.observe(doc, learn=True, update_gate_stats=(i == 0),
                                 prompt_weight=1.0)
-        self._buffer_add(doc)
+        self._buffer_add(doc, kind="curated", prompt=pk, response=rk,
+                         source="teach")
         return e
 
     def revise(self, prompt: str, old_response: str, new_response: str,
@@ -355,12 +426,20 @@ class SLM(Model):
             opt.step()
         # purge stale buffer lessons (prompt + old response) so future sleeps
         # don't re-burn the superseded belief
-        pk, ok_ = prompt.strip()[:80], old_response.strip()[:40]
+        pk, ok_ = prompt.strip(), old_response.strip()
+
+        def _stale(d):
+            if isinstance(d, dict) and d.get("prompt") is not None:
+                return (d["prompt"] == pk
+                        and (d.get("response") or "").strip() == ok_)
+            t = self._entry_text(d)          # legacy string entries
+            return pk[:80] in t and ok_[:40] in t
         before = len(self.replay_buffer)
-        self.replay_buffer = [d for d in self.replay_buffer
-                              if not (pk in d and ok_ in d)]
-        # store the new binding as a lesson
-        self._buffer_add(_doc(prompt, new_response))
+        self.replay_buffer = [d for d in self.replay_buffer if not _stale(d)]
+        # store the new binding as a protected lesson
+        self._buffer_add(_doc(prompt, new_response), kind="curated",
+                         prompt=pk, response=new_response.strip(),
+                         source="revise")
         return {"steps": steps, "purged": before - len(self.replay_buffer) + 1}
 
 
@@ -428,7 +507,8 @@ class SLM(Model):
         g0 = self.ask(prompt, system_prompt)
         if key.lower() not in g0.lower() and len(g0.strip()) > 8:
             if verbose:
-                print(f"[bind] displacing prior answer via revise(): {g0[:60]!r}")
+                logger.info("bind: displacing prior answer via revise(): %r",
+                            g0[:60])
             self.revise(prompt, g0.strip(), response, steps=10)
         chat = ([{"role": "system", "content": system_prompt}]
                 if system_prompt else [])
@@ -455,9 +535,9 @@ class SLM(Model):
             g = self.ask(prompt, system_prompt)
             hit = key.lower() in g.lower()
             if verbose:
-                print(f"[bind] round {round_:2d}: "
-                      f"P={self.prob(prompt, response):.4f}  "
-                      f"gen={'HIT ' if hit else ''}{g[:60]!r}")
+                logger.info("bind round %2d: P=%.4f gen=%s%r", round_,
+                            self.prob(prompt, response),
+                            "HIT " if hit else "", g[:60])
             if hit:
                 return True
         return False
@@ -508,7 +588,7 @@ class SLM(Model):
             e = self.observe(doc, learn=True, epochs=epochs)
             if e is not None:
                 surprises.append(e)
-            self._buffer_add(doc)
+            self._buffer_add(doc, kind="raw", source="history")
             if start + chunk >= len(norm):
                 break
         # curate (user -> final assistant answer) pairs; skip tool-call turns
@@ -553,9 +633,16 @@ class SLM(Model):
             for _ in range(epochs):
                 docs = list(self.replay_buffer)
                 random.shuffle(docs)
-                # sleep replay must not pollute the wake surprise EMA
-                es = [self._m.observe(d, learn=True, update_gate_stats=False,
-                                      prompt_weight=1.0)
+                # sleep replay must not pollute the wake surprise EMA.
+                # ONLY curated lessons replay at full prompt weight — raw
+                # transcripts keep the damped assistant weighting, otherwise
+                # sleep burns tool output/boilerplate (and any injected text)
+                # at 1.0 for epochs x buffer updates, re-opening the wake-time
+                # poisoning damping.
+                es = [self._m.observe(
+                          self._entry_text(d), learn=True,
+                          update_gate_stats=False,
+                          prompt_weight=1.0 if self._entry_kind(d) == "curated" else None)
                       for d in docs]
                 es = [e for e in es if e is not None]
                 last = sum(es) / max(len(es), 1)
@@ -575,6 +662,7 @@ class SLM(Model):
                 self._deep_params[i + 1].zero_()
         self.turn_count = 0
         self.surprise_log = []
+        self.audit_log = []
         self.replay_buffer = []
         self._buffer_seen = 0
 
@@ -651,8 +739,13 @@ class SLM(Model):
         def _pairs(buf):
             out = {}
             for d in buf:
+                if isinstance(d, dict) and d.get("prompt"):
+                    out.setdefault(d["prompt"].strip(),
+                                   set()).add((d.get("response") or "").strip())
+                    continue
+                text = d["text"] if isinstance(d, dict) else d
                 for rx in _pair_res:
-                    mm = rx.search(d)
+                    mm = rx.search(text)
                     if mm:
                         out.setdefault(mm.group(1).strip(),
                                        set()).add(mm.group(2).strip())
@@ -673,46 +766,146 @@ class SLM(Model):
             strategy = "relearn"
 
         if strategy == "sum":
+            # EXACT composition. Summing the LoRA FACTORS is wrong math:
+            # (sum A_i)(sum B_i) = sum A_i B_i + sum_{i!=j} A_i B_j — each
+            # agent draws its own random A, so the cross terms are the same
+            # order of magnitude as the signal (measured rel. error ~1.0).
+            # The exact composed delta is RANK CONCATENATION, re-compressed
+            # to the instance rank via thin-QR + small SVD (_merge_factors);
+            # the dense delta (d_in x vocab) is never materialized.
+            for c in ckpts:
+                if (c["A"].shape[0] != self._m.head.A.shape[0]
+                        or c["B"].shape[1] != self._m.head.B.shape[1]):
+                    raise ValueError(
+                        "merge_experience: head shape mismatch — checkpoint "
+                        f"A{tuple(c['A'].shape)}/B{tuple(c['B'].shape)} vs "
+                        f"instance A{tuple(self._m.head.A.shape)}/"
+                        f"B{tuple(self._m.head.B.shape)}")
+                dl = c.get("deep", [])
+                if dl and len(dl) != len(self._deep_params):
+                    raise ValueError(
+                        f"merge_experience: checkpoint has {len(dl)} deep "
+                        f"tensors, instance has {len(self._deep_params)} — "
+                        "merging requires identical placement/deep_blocks")
             with torch.no_grad():
-                A = sum(c["A"] for c in ckpts)
-                B = sum(c["B"] for c in ckpts)
-                self._m.head.A.copy_(A.to(self._m.head.A.dtype))
-                self._m.head.B.copy_(B.to(self._m.head.B.dtype))
-                for i, p in enumerate(self._deep_params):
-                    s = sum(c["deep"][i] for c in ckpts if c.get("deep"))
-                    p.copy_(s.to(p.dtype).to(p.device))
+                A, B = self._merge_factors(
+                    [c["A"] for c in ckpts], [c["B"] for c in ckpts],
+                    self._m.head.A.shape[1])
+                hA, hB = self._m.head.A, self._m.head.B
+                hA.copy_(A.to(hA.dtype).to(hA.device))
+                hB.copy_(B.to(hB.dtype).to(hB.device))
+                deep_lists = [c["deep"] for c in ckpts if c.get("deep")]
+                if deep_lists:
+                    for pi in range(0, len(self._deep_params), 2):
+                        A, B = self._merge_factors(
+                            [dl[pi] for dl in deep_lists],
+                            [dl[pi + 1] for dl in deep_lists],
+                            self._deep_params[pi].shape[1])
+                        pA = self._deep_params[pi]
+                        pB = self._deep_params[pi + 1]
+                        pA.copy_(A.to(pA.dtype).to(pA.device))
+                        pB.copy_(B.to(pB.dtype).to(pB.device))
         elif strategy == "relearn":
             self.reset()
             lessons = []
             for c in ckpts:
                 lessons.extend(c.get("replay_buffer", []))
+            lessons = [d if isinstance(d, dict)
+                       else self._entry(d, "raw", source="legacy")
+                       for d in lessons]
             random.Random(0).shuffle(lessons)
             for _ in range(3):
                 for d in lessons:
-                    self._m.observe(d, learn=True, update_gate_stats=False)
+                    self._m.observe(
+                        d["text"], learn=True, update_gate_stats=False,
+                        prompt_weight=1.0 if d.get("kind") == "curated" else None)
             self.replay_buffer = lessons[-self.replay_cap:]
         else:
             raise ValueError(f"unknown strategy: {strategy}")
         # merge buffers regardless (for future consolidation)
         merged_buf = []
         for c in ckpts:
-            merged_buf.extend(c.get("replay_buffer", []))
+            merged_buf.extend(
+                d if isinstance(d, dict)
+                else self._entry(d, "raw", source="legacy")
+                for d in c.get("replay_buffer", []))
         if strategy == "sum":
             self.replay_buffer = merged_buf[-self.replay_cap:]
         return {"merged": len(paths), "strategy": strategy,
                 "lessons": len(merged_buf), "conflicts": len(conflicts)}
 
+    @staticmethod
+    def _merge_factors(As, Bs, r_out):
+        """Exact LoRA composition: delta = sum_i A_i B_i == A_cat @ B_cat
+        (rank concatenation), re-compressed to rank r_out.
+
+        When total rank K <= r_out the result is EXACT (zero-padded).
+        Otherwise: thin-QR both stacked factors, SVD the small K x K core,
+        keep the top-r_out singular triplets — the optimal rank-r_out
+        approximation of the true sum, without ever materializing the
+        dense (d_in x d_out) delta."""
+        import torch
+        As = [a.float() for a in As]
+        Bs = [b.float() for b in Bs]
+        A_cat = torch.cat(As, dim=1)            # [d_in, K]
+        B_cat = torch.cat(Bs, dim=0)            # [K, d_out]
+        K = A_cat.shape[1]
+        if K <= r_out:
+            A = torch.zeros(A_cat.shape[0], r_out, dtype=A_cat.dtype,
+                            device=A_cat.device)
+            B = torch.zeros(r_out, B_cat.shape[1], dtype=B_cat.dtype,
+                            device=B_cat.device)
+            A[:, :K] = A_cat
+            B[:K, :] = B_cat
+            return A, B
+        Qa, Ra = torch.linalg.qr(A_cat)         # [d_in,K], [K,K]
+        Qb, Rb = torch.linalg.qr(B_cat.t())     # [d_out,K], [K,K]
+        U, S, Vh = torch.linalg.svd(Ra @ Rb.t())
+        s = S[:r_out].clamp(min=0).sqrt()
+        A = Qa @ U[:, :r_out] * s               # [d_in, r_out]
+        B = (Qb @ Vh.t()[:, :r_out] * s).t()    # [r_out, d_out]
+        return A, B
+
     def load_fast_weights(self, path: str):
         import torch
         # weights_only=True — tensors/str/primitives only, no pickle RCE
         ckpt = torch.load(path, map_location=self._m.device, weights_only=True)
+        # shape/compat validation — fail loudly instead of cryptic copy_
+        # errors or silently-truncating zips
+        hA, hB = self._m.head.A, self._m.head.B
+        if (tuple(ckpt["A"].shape) != tuple(hA.shape)
+                or tuple(ckpt["B"].shape) != tuple(hB.shape)):
+            raise ValueError(
+                f"load_fast_weights: head rank mismatch — checkpoint "
+                f"r={ckpt['A'].shape[1]} (A{tuple(ckpt['A'].shape)}) vs "
+                f"instance r={hA.shape[1]} (A{tuple(hA.shape)}). "
+                "Construct the SLM with the same plasticity/r_fast as the "
+                "checkpoint.")
+        deep_saved = ckpt.get("deep", [])
+        if len(deep_saved) != len(self._deep_params):
+            logger.warning(
+                "load_fast_weights: checkpoint has %d deep tensors but this "
+                "instance has %d — DEEP WEIGHTS SKIPPED (deep-stored "
+                "knowledge will be missing). Match placement/deep_blocks to "
+                "load them.", len(deep_saved), len(self._deep_params))
+            deep_saved = []
+        for meta in ("plasticity", "placement"):
+            want = ckpt.get(meta)
+            have = getattr(self, meta, None)
+            if want and have and want != have:
+                logger.warning(
+                    "load_fast_weights: checkpoint %s=%r != instance %s=%r",
+                    meta, want, meta, have)
         with torch.no_grad():
-            self._m.head.A.copy_(ckpt["A"].to(self._m.head.A.dtype))
-            self._m.head.B.copy_(ckpt["B"].to(self._m.head.B.dtype))
-            for p, saved in zip(self._deep_params, ckpt.get("deep", [])):
+            hA.copy_(ckpt["A"].to(hA.dtype))
+            hB.copy_(ckpt["B"].to(hB.dtype))
+            for p, saved in zip(self._deep_params, deep_saved):
                 p.copy_(saved.to(p.dtype).to(p.device))
         self.turn_count = ckpt.get("turn_count", 0)
-        self.replay_buffer = list(ckpt.get("replay_buffer", []))
+        # legacy checkpoints stored plain strings — wrap into entries
+        self.replay_buffer = [
+            d if isinstance(d, dict) else self._entry(d, "raw", source="legacy")
+            for d in ckpt.get("replay_buffer", [])]
         self._buffer_seen = len(self.replay_buffer)
 
     # ---------- helpers ----------

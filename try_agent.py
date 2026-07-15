@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Interactive self-learning agent — every turn physically updates the weights.
 
-Run:  BYPASS_TOOL_CONSENT=true .venv/bin/python try_agent.py
+Run:  .venv/bin/python try_agent.py
 
     you> what is the name of the maintenance robot on deck 12?    # unknown
     you> /teach what is the name of the maintenance robot on deck 12? | It is called RUSTY-9.
@@ -26,7 +26,7 @@ CKPT = "/tmp/slm_try_agent.pt"
 
 print("loading model (plasticity=high, deep placement)...")
 # prompt_loss_weight=1.0: user/tool tokens learn at FULL weight (equal to
-# assistant). Trade-off: disables the E16 anti-poisoning damping — anything
+# assistant). Trade-off: disables the anti-poisoning damping - anything
 # pasted into the chat (tool output, injected text) also learns at 1.0.
 m = SLM(plasticity="high", placement="deep", max_tokens=256, replay_k=2,
         prompt_loss_weight=1.0)
@@ -34,9 +34,11 @@ AUTO_TEACH = True   # curate (question -> answer) each turn; /auto toggles
 if os.path.exists(CKPT):   # auto-resume: pick up where the last session left off
     m.load_fast_weights(CKPT)
     print(f"[auto-load] {CKPT}")
+
 agent = Agent(model=m, tools=[shell], callback_handler=None, system_prompt=SYSTEM)
 TOOL_SPECS = agent.tool_registry.get_all_tool_specs()
 norm = lambda: m._m.head.B.norm().item()
+
 print(f"ready. ||B||={norm():.4f}\n" + __doc__.split("Commands:")[1])
 
 while True:
@@ -80,7 +82,7 @@ while True:
         reply = agent(q)
         print(f"\nagent> {reply}")
         if AUTO_TEACH:
-            # E41: raw transcripts teach form, not facts — curate the pair so
+            # raw transcripts teach form, not facts - curate the pair so
             # conversational facts stick by default.
             m.teach(q, str(reply).strip(), epochs=1)
         print(f"[learned: ||B|| {before:.4f} -> {norm():.4f}]")

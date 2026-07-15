@@ -363,6 +363,104 @@ class SLM(Model):
         self._buffer_add(_doc(prompt, new_response))
         return {"steps": steps, "purged": before - len(self.replay_buffer) + 1}
 
+
+    # ---------- probe & bind helpers (used by try_agent.py) ----------
+    def ask(self, question: str, system_prompt: Optional[str] = None,
+            max_new_tokens: int = 48) -> str:
+        """Greedy, weights-only answer (no tools, no sampling).
+
+        The cleanest way to see what the weights know — before/after teach().
+        """
+        import torch
+        chat = ([{"role": "system", "content": system_prompt}]
+                if system_prompt else [])
+        chat.append({"role": "user", "content": question})
+        ids = self._m.tok.apply_chat_template(
+            chat, add_generation_prompt=True, return_tensors="pt",
+            **self._tmpl_kw())
+        if not torch.is_tensor(ids):
+            ids = ids["input_ids"]
+        ids = ids.to(self._m.device)
+        with torch.no_grad():
+            out = self._m.model.generate(
+                input_ids=ids, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=self._m.tok.eos_token_id)
+        return self._m.tok.decode(out[0, ids.shape[1]:],
+                                  skip_special_tokens=True)
+
+    def prob(self, prompt: str, response: str) -> float:
+        """Mean per-token P(response | prompt) under the templated chat."""
+        import torch
+        ids = self._m.tok.apply_chat_template(
+            [{"role": "user", "content": prompt}], add_generation_prompt=True,
+            return_tensors="pt", **self._tmpl_kw())
+        if not torch.is_tensor(ids):
+            ids = ids["input_ids"]
+        ids = ids.to(self._m.device)
+        ans = self._m.tok(response, return_tensors="pt",
+                          add_special_tokens=False).input_ids.to(self._m.device)
+        full = torch.cat([ids, ans], dim=1)
+        with torch.no_grad():
+            lp = torch.log_softmax(
+                self._m.model(input_ids=full).logits[0].float(), -1)
+        tot = sum(lp[i, full[0, i + 1]].item()
+                  for i in range(ids.shape[1] - 1, full.shape[1] - 1))
+        return float(torch.exp(torch.tensor(tot / max(ans.shape[1], 1))))
+
+    def bind(self, prompt: str, response: str,
+             system_prompt: Optional[str] = None, tool_specs=None,
+             key: Optional[str] = None, max_rounds: int = 12,
+             verbose: bool = True) -> bool:
+        """Teach a fact until greedy generation flips. Returns True on success.
+
+        Displaces a consolidated prior via revise() when needed, then repeats
+        teach() across bare / system-prompt / tool-spec chat renders until
+        ask() emits the key token (the most distinctive word of the response,
+        auto-detected unless given). Stops at first hit — over-training babbles.
+        """
+        if key is None:
+            words = response.replace(".", " ").replace(",", " ").split()
+            distinctive = [w for w in words if any(c.isdigit() for c in w)
+                           or (w.isupper() and len(w) > 2)
+                           or ("-" in w and len(w) > 3)]
+            key = distinctive[-1] if distinctive else words[-1]
+        g0 = self.ask(prompt, system_prompt)
+        if key.lower() not in g0.lower() and len(g0.strip()) > 8:
+            if verbose:
+                print(f"[bind] displacing prior answer via revise(): {g0[:60]!r}")
+            self.revise(prompt, g0.strip(), response, steps=10)
+        chat = ([{"role": "system", "content": system_prompt}]
+                if system_prompt else [])
+        chat += [{"role": "user", "content": prompt},
+                 {"role": "assistant", "content": response}]
+        docs = []
+        try:
+            docs.append(self._m.tok.apply_chat_template(
+                chat, tokenize=False, **self._tmpl_kw()))
+        except Exception:
+            pass
+        if tool_specs:
+            try:
+                docs.append(self._m.tok.apply_chat_template(
+                    chat, tokenize=False,
+                    tools=self._tools_for_template(tool_specs),
+                    **self._tmpl_kw()))
+            except Exception:
+                pass
+        for round_ in range(1, max_rounds + 1):
+            self.teach(prompt, response, epochs=2)
+            for d in docs:
+                self.observe(d, learn=True, epochs=1, update_gate_stats=False)
+            g = self.ask(prompt, system_prompt)
+            hit = key.lower() in g.lower()
+            if verbose:
+                print(f"[bind] round {round_:2d}: "
+                      f"P={self.prob(prompt, response):.4f}  "
+                      f"gen={'HIT ' if hit else ''}{g[:60]!r}")
+            if hit:
+                return True
+        return False
+
     def consolidate(self, epochs: int = 5, lr_boost: float = 1.0):
         """Sleep phase: replay the whole turn buffer to consolidate knowledge.
 

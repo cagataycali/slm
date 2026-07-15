@@ -29,6 +29,9 @@ print("loading model (plasticity=high, deep placement)...")
 m = SLM(plasticity="high", placement="deep", max_tokens=256, replay_k=2,
         prompt_loss_weight=1.0)
 AUTO_TEACH = True   # curate (question -> answer) each turn; /auto toggles
+if os.path.exists(CKPT):   # auto-resume: pick up where the last session left off
+    m.load_fast_weights(CKPT)
+    print(f"[auto-load] {CKPT}")
 agent = Agent(model=m, tools=[shell], callback_handler=None, system_prompt=SYSTEM)
 TOOL_SPECS = agent.tool_registry.get_all_tool_specs()
 norm = lambda: m._m.head.B.norm().item()

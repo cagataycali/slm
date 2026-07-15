@@ -17,8 +17,12 @@ with a plastic layer that keeps learning at inference — with a provable off-sw
 > for smoke tests). ~21M plastic params (~1%) over a frozen 2.13B base.
 
 ```bash
-pip install strands-slm
+pip install "strands-slm[tools]"   # core + strands-agents + strands-agents-tools (shell, etc.)
 ```
+
+`strands-agents` (the SDK) is a core dependency. Extras: `[tools]` for the
+community tool suite used in the examples, `[train]` to reproduce the
+post-tune, `[dev]` for tests.
 
 **Contents:** [Quickstart](#quickstart) · [Watch it learn](#watch-it-learn) · [Supported models](#supported-models) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
 
@@ -224,7 +228,7 @@ replication, latency) is in the paper draft under `paper/` with logs in
 ## Reproduce the post-tune
 
 ```bash
-pip install "strands-slm[train]"
+pip install "strands-slm[train,tools]"
 python scripts/build_corpus.py       # strands-agents repos -> corpus.jsonl
 python scripts/train_lora.py --steps 1200 --bs 2 --accum 4 --lr 1e-4
 python scripts/eval_strands.py       # base vs tuned probes

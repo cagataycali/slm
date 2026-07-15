@@ -22,9 +22,11 @@ dependencies = [
     "transformers>=4.45",
     "huggingface_hub>=0.20",
     "peft>=0.10",
+    "strands-agents>=1.0",
 ]
 
 [project.optional-dependencies]
+tools = ["strands-agents-tools"]
 train = ["accelerate"]
 dev = ["pytest"]
 

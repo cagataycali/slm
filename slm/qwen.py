@@ -159,6 +159,9 @@ class StrandsPlasticQwen:
             try:
                 return AutoModelForImageTextToText.from_pretrained(
                     mid, dtype=dtype, device_map=device, token=token)
+            except torch.OutOfMemoryError:
+                raise   # real problem (e.g. GPU busy) — don't mask it with a
+                        # config-class fallback error
             except Exception:
                 from transformers import AutoModelForCausalLM
                 return AutoModelForCausalLM.from_pretrained(

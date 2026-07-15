@@ -17,12 +17,15 @@ with a plastic layer that keeps learning at inference — with a provable off-sw
 > for smoke tests). ~21M plastic params (~1%) over a frozen 2.13B base.
 
 ```bash
-pip install "strands-slm[tools]"   # core + strands-agents + strands-agents-tools (shell, etc.)
+uv venv && source .venv/bin/activate
+uv pip install "strands-slm[tools,training]"   # everything you need to run every example below
 ```
 
+(or plain `pip install "strands-slm[tools,training]"` if you don't use uv.)
+
 `strands-agents` (the SDK) is a core dependency. Extras: `[tools]` for the
-community tool suite used in the examples, `[train]` to reproduce the
-post-tune, `[dev]` for tests.
+community tool suite used in the examples, `[training]` to reproduce the
+post-tune (alias: `[train]`), `[dev]` for tests.
 
 **Contents:** [Quickstart](#quickstart) · [Watch it learn](#watch-it-learn) · [Supported models](#supported-models) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
 
@@ -44,13 +47,22 @@ agent("use the shell tool to run: echo hello")   # this turn updated the weights
 Prove it's the weights and not the context window:
 
 ```python
-model.bind("what is my name?", "Your name is Cagatay.")  # teach until greedy flips
-model.save_fast_weights("brain.pt")
+# ── process 1: teach, then save ──────────────────────────────
+from slm import SLM
 
-# ... new process, fresh model, EMPTY context ...
 model = SLM("cagataydev/strands-qwen3-vl-2b")
 model.ask("what is my name?")          # doesn't know
-model.load_fast_weights("brain.pt")
+model.bind("what is my name?", "Your name is Cagatay.")  # teach until greedy flips
+model.save_fast_weights("brain.pt")    # creates brain.pt — run this BEFORE process 2
+```
+
+```python
+# ── process 2: fresh model, EMPTY context ────────────────────
+from slm import SLM
+
+model = SLM("cagataydev/strands-qwen3-vl-2b")
+model.ask("what is my name?")          # doesn't know
+model.load_fast_weights("brain.pt")    # restore the experience saved in process 1
 model.ask("what is my name?")          # "Your name is Cagatay." — from weights
 model.reset()                          # forgotten, bit-exact base again
 ```
@@ -228,7 +240,7 @@ replication, latency) is in the paper draft under `paper/` with logs in
 ## Reproduce the post-tune
 
 ```bash
-pip install "strands-slm[train,tools]"
+uv pip install "strands-slm[training,tools]"
 python scripts/build_corpus.py       # strands-agents repos -> corpus.jsonl
 python scripts/train_lora.py --steps 1200 --bs 2 --accum 4 --lr 1e-4
 python scripts/eval_strands.py       # base vs tuned probes

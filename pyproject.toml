@@ -27,7 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 tools = ["strands-agents-tools"]
-train = ["accelerate"]
+training = ["accelerate"]
+train = ["accelerate"]  # alias for [training]
 dev = ["pytest"]
 
 [project.urls]

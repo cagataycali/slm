@@ -72,6 +72,9 @@ class SLM(Model):
         self.config = {"model_id": model_id, "max_tokens": max_tokens,
                        "temperature": temperature, "plasticity": plasticity}
         self.turn_count = 0
+        # some chat templates (Gemma 4) silently DROP role="tool" messages —
+        # probe once; if dropped, tool results are folded into a user turn.
+        self._tool_role_ok = self._probe_tool_role()
         self.surprise_log = []          # (turn, pre-update NLL)
         self.replay_buffer = []         # past turn transcripts (for rehearsal)
         self.replay_k = int(kwargs.get("replay_k", 3))
@@ -97,9 +100,14 @@ class SLM(Model):
         import torch
 
         chat = self._to_chat(messages, system_prompt, tool_specs)
-        ids = self._m.tok.apply_chat_template(
-            chat, add_generation_prompt=True, return_tensors="pt",
-            tools=self._tools_for_template(tool_specs))
+        try:
+            ids = self._m.tok.apply_chat_template(
+                chat, add_generation_prompt=True, return_tensors="pt",
+                tools=self._tools_for_template(tool_specs))
+        except Exception:
+            # some templates reject the tools= kwarg — degrade gracefully
+            ids = self._m.tok.apply_chat_template(
+                chat, add_generation_prompt=True, return_tensors="pt")
         if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
             ids = ids["input_ids"]
         ids = ids.to(self._m.device)
@@ -208,9 +216,20 @@ class SLM(Model):
         layers = (inner.language_model.layers
                   if hasattr(inner, "language_model") else inner.layers)
         n = len(layers)
+        # preferred: q_proj + v_proj. Some archs (Gemma 4 mobile) share KV
+        # across layers and expose only q_proj/o_proj — probe what exists.
+        probe = layers[-1].self_attn
+        names = [nm for nm in ("q_proj", "v_proj") if hasattr(probe, nm)]
+        if "v_proj" not in names and hasattr(probe, "o_proj"):
+            names.append("o_proj")   # o_proj ~ value-path surrogate
+        if not names:
+            raise RuntimeError(
+                f"deep placement: no attachable projections on "
+                f"{type(probe).__name__} — use placement='head'")
+        self._deep_proj_names = tuple(names)
         for li in range(max(0, n - k_blocks), n):
             attn = layers[li].self_attn
-            for name in ("q_proj", "v_proj"):
+            for name in names:
                 lora = _DeepLoRA(getattr(attn, name), r=r)
                 setattr(attn, name, lora)
                 self._deep_params += [lora.A, lora.B]
@@ -438,13 +457,29 @@ class SLM(Model):
         # C41 guardrail: detect conflicting lessons (same user prompt, different
         # assistant response) across checkpoints. SUM on conflicts corrupts
         # (superposed deltas -> babble that smears into neighbors).
+        _pair_res = [
+            # Qwen
+            _re.compile(r"<\|im_start\|>user\n(.+?)<\|im_end\|>.*?"
+                        r"<\|im_start\|>assistant\n(.+?)(?:<\|im_end\|>|$)", _re.DOTALL),
+            # Gemma 4
+            _re.compile(r"<\|turn>user\n(.+?)<turn\|>.*?"
+                        r"<\|turn>model\n(.+?)(?:<turn\|>|$)", _re.DOTALL),
+            # Gemma 2/3
+            _re.compile(r"<start_of_turn>user\n(.+?)<end_of_turn>.*?"
+                        r"<start_of_turn>model\n(.+?)(?:<end_of_turn>|$)", _re.DOTALL),
+            # raw fallback (template-less _transcript path)
+            _re.compile(r"^user: (.+?)\nassistant: (.+?)$", _re.DOTALL),
+        ]
+
         def _pairs(buf):
             out = {}
             for d in buf:
-                mm = _re.search(r"user\n(.+?)<\|im_end\|>.*?assistant\n(.+?)<\|im_end\|>",
-                                d, _re.DOTALL)
-                if mm:
-                    out.setdefault(mm.group(1).strip(), set()).add(mm.group(2).strip())
+                for rx in _pair_res:
+                    mm = rx.search(d)
+                    if mm:
+                        out.setdefault(mm.group(1).strip(),
+                                       set()).add(mm.group(2).strip())
+                        break
             return out
 
         merged_pairs = {}
@@ -504,6 +539,17 @@ class SLM(Model):
         self._buffer_seen = len(self.replay_buffer)
 
     # ---------- helpers ----------
+    def _probe_tool_role(self) -> bool:
+        """True iff the chat template preserves role='tool' content."""
+        try:
+            r = self._m.tok.apply_chat_template(
+                [{"role": "user", "content": "q"},
+                 {"role": "assistant", "content": "a"},
+                 {"role": "tool", "content": "TOOL_PROBE_XYZ"}], tokenize=False)
+            return "TOOL_PROBE_XYZ" in r
+        except Exception:
+            return False
+
     @staticmethod
     def _content_to_text(content) -> str:
         if isinstance(content, str):
@@ -536,7 +582,12 @@ class SLM(Model):
             is_tool_result = any("toolResult" in b for b in msg.get("content", [])
                                  if isinstance(b, dict))
             if is_tool_result:
-                chat.append({"role": "tool", "content": text})
+                if getattr(self, "_tool_role_ok", True):
+                    chat.append({"role": "tool", "content": text})
+                else:
+                    # Gemma 4 template drops role="tool" — fold into user turn
+                    chat.append({"role": "user",
+                                 "content": f"[tool result]\n{text}"})
             else:
                 chat.append({"role": role, "content": text})
         return chat
@@ -554,19 +605,40 @@ class SLM(Model):
 
     @staticmethod
     def _parse_tool_call(text: str):
-        """Parse Qwen-style <tool_call>{...}</tool_call> from generated text."""
+        """Parse a tool call from generated text.
+
+        Supports Qwen (<tool_call>{json}</tool_call>) and Gemma 4
+        (<|tool>call:name{args}<tool|>, with <|"|> quote tokens)."""
         import re
         import uuid
+        # Qwen style
         mm = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-        if not mm:
-            return None
-        try:
-            obj = json.loads(mm.group(1))
+        if mm:
+            try:
+                obj = json.loads(mm.group(1))
+                return {"toolUseId": f"slm-{uuid.uuid4().hex[:8]}",
+                        "name": obj["name"],
+                        "input": obj.get("arguments", {})}
+            except (json.JSONDecodeError, KeyError):
+                return None
+        # Gemma 4 style
+        mm = re.search(r"<\|tool>call:([\w.-]+)\s*(\{.*?\})\s*<tool\|>",
+                       text, re.DOTALL)
+        if mm:
+            raw = mm.group(2).replace('<|"|>', '"')
+            try:
+                args = json.loads(raw)
+            except json.JSONDecodeError:
+                # keys may be unquoted in Gemma renders — best-effort repair
+                try:
+                    repaired = re.sub(r"([{,]\s*)([A-Za-z_][\w-]*)(\s*:)",
+                                      r'\1"\2"\3', raw)
+                    args = json.loads(repaired)
+                except json.JSONDecodeError:
+                    return None
             return {"toolUseId": f"slm-{uuid.uuid4().hex[:8]}",
-                    "name": obj["name"],
-                    "input": obj.get("arguments", {})}
-        except (json.JSONDecodeError, KeyError):
-            return None
+                    "name": mm.group(1), "input": args}
+        return None
 
     def _transcript(self, messages: Messages, reply: str) -> str:
         """Render the turn in the REAL chat template so learning transfers to

@@ -25,10 +25,69 @@ import os
 import re
 
 DEFAULT_MODEL = "cagataydev/strands-qwen3-vl-2b"
+GEMMA_MODEL = "cagataydev/strands-gemma4-e2b"
 
-# assistant content span inside a Qwen chat template render
-_ASSISTANT_RE = re.compile(
-    r"<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)", re.DOTALL)
+# assistant content span inside a chat template render — per model family.
+# picked automatically by probing the tokenizer's rendered template.
+_ASSISTANT_RES = [
+    # Qwen: <|im_start|>assistant\n ... <|im_end|>
+    re.compile(r"<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)", re.DOTALL),
+    # Gemma 4: <|turn>model\n ... <turn|>
+    re.compile(r"<\|turn>model\n(.*?)(?:<turn\|>|$)", re.DOTALL),
+    # Gemma 2/3: <start_of_turn>model\n ... <end_of_turn>
+    re.compile(r"<start_of_turn>model\n(.*?)(?:<end_of_turn>|$)", re.DOTALL),
+]
+_ASSISTANT_RE = _ASSISTANT_RES[0]  # backward-compat default
+
+
+def _pick_assistant_re(tok):
+    """Probe the tokenizer's chat template to find the assistant-span regex."""
+    try:
+        probe = tok.apply_chat_template(
+            [{"role": "user", "content": "q"},
+             {"role": "assistant", "content": "PROBE_ANSWER"}], tokenize=False)
+    except Exception:
+        return _ASSISTANT_RES[0]
+    for rx in _ASSISTANT_RES:
+        m = rx.search(probe)
+        if m and "PROBE_ANSWER" in m.group(1):
+            return rx
+    return _ASSISTANT_RES[0]
+
+
+def _dequantize_qat(model):
+    """Gemma-4 QAT mobile ships int8 QuantizedLinear wrappers. Swap them for
+    dense bf16/fp32 nn.Linear so PEFT adapters attach and autograd flows.
+    No-op on models without QuantizedLinear."""
+    import torch
+    import torch.nn as nn
+    dtype = next(model.parameters()).dtype
+    n = 0
+    for _, mod in list(model.named_modules()):
+        for child_name, child in list(mod.named_children()):
+            if type(child).__name__ == "QuantizedLinear":
+                W = child._dequantize_weights(torch.float32).to(dtype)
+                lin = nn.Linear(child.in_features, child.out_features,
+                                bias=child.bias is not None, dtype=dtype)
+                with torch.no_grad():
+                    lin.weight.copy_(W)
+                    if child.bias is not None:
+                        lin.bias.copy_(child.bias.to(dtype))
+                lin = lin.to(child._dequantize_weights(torch.float32).device)
+                setattr(mod, child_name, lin)
+                n += 1
+    return n
+
+
+def _peft_base(model_id, token):
+    """If model_id is a PEFT adapter repo, return its base model id, else None."""
+    try:
+        from huggingface_hub import hf_hub_download
+        import json
+        p = hf_hub_download(model_id, "adapter_config.json", token=token)
+        return json.load(open(p)).get("base_model_name_or_path")
+    except Exception:
+        return None
 
 
 def _require_torch():
@@ -60,6 +119,7 @@ class StrandsPlasticQwen:
         # prompt tokens learn at reduced weight (not hard -100 mask)
         # — hard masking destroyed prompt-familiarity binding (T6: 3/8 recall)
         self.prompt_loss_weight = prompt_loss_weight
+        self.assistant_re = _ASSISTANT_RE   # overridden per-template in from_pretrained
         self.device = next(model.parameters()).device
 
     # ---------------- constructors ----------------
@@ -76,9 +136,39 @@ class StrandsPlasticQwen:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         token = token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
         dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
-        proc = AutoProcessor.from_pretrained(model_id, token=token)
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_id, dtype=dtype, device_map=device, token=token)
+
+        # adapter repo? (e.g. cagataydev/strands-gemma4-e2b) -> load base + merge
+        base_id = _peft_base(model_id, token)
+        weights_id = base_id or model_id
+
+        try:
+            proc = AutoProcessor.from_pretrained(weights_id, token=token)
+            tok_ = getattr(proc, "tokenizer", proc)
+        except Exception:
+            from transformers import AutoTokenizer
+            tok_ = AutoTokenizer.from_pretrained(weights_id, token=token)
+            proc = tok_
+
+        def _load(mid):
+            try:
+                return AutoModelForImageTextToText.from_pretrained(
+                    mid, dtype=dtype, device_map=device, token=token)
+            except Exception:
+                from transformers import AutoModelForCausalLM
+                return AutoModelForCausalLM.from_pretrained(
+                    mid, dtype=dtype, device_map=device, token=token)
+
+        model = _load(weights_id)
+
+        if base_id is not None:
+            # QAT bases (Gemma-4 mobile): dequantize so the adapter attaches
+            n_deq = _dequantize_qat(model)
+            if n_deq:
+                model = model.to(device)
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, model_id, token=token)
+            model = model.merge_and_unload()   # slow weights baked in, then frozen
+
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
@@ -94,7 +184,9 @@ class StrandsPlasticQwen:
         for pp in pth:
             parent = getattr(parent, pp)
         setattr(parent, last, head)
-        return cls(model, proc.tokenizer, head, **kw)
+        inst = cls(model, tok_, head, **kw)
+        inst.assistant_re = _pick_assistant_re(tok_)
+        return inst
 
     # ---------------- fast self-learning ----------------
     def reset(self):
@@ -130,7 +222,7 @@ class StrandsPlasticQwen:
         weight 1.0; everything else gets prompt_loss_weight (default 0.1).
         Returns None when the text has no chat-template markers."""
         import torch
-        spans = [m.span(1) for m in _ASSISTANT_RE.finditer(text)]
+        spans = [m.span(1) for m in self.assistant_re.finditer(text)]
         if not spans:
             return None
         keep = torch.zeros(ids.shape[1], dtype=torch.bool)

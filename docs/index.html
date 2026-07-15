@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slm — the model that is never done training</title>
+<meta name="description" content="A model that rewrites its own weights while it runs. Surprise-gated, bounded, provably resettable test-time learning on a real 2B LLM.">
+<meta property="og:title" content="slm — the model that is never done training">
+<meta property="og:description" content="Every LLM you've used is frozen at birth. This one rewrites its own weights while it runs — and there's a live demo in this page.">
+<link rel="canonical" href="https://cagataycali.github.io/slm/">
+<meta property="og:url" content="https://cagataycali.github.io/slm/">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#07090f">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"slm — self-learning model","description":"A model that rewrites its own weights while it runs. Surprise-gated, bounded, provably resettable test-time learning on a real 2B LLM.","url":"https://cagataycali.github.io/slm/","applicationCategory":"DeveloperApplication","operatingSystem":"Any","offers":{"@type":"Offer","price":"0"},"softwareRequirements":"pip install strands-slm","codeRepository":"https://github.com/cagataycali/slm"}</script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>S</text></svg>">
+<style>
+:root{
+  --bg:#07090f; --bg2:#0b0f18; --panel:#0f1522; --line:#1c2637;
+  --tx:#dbe4f0; --dim:#7b8aa0; --faint:#3d4a5e;
+  --cy:#38e1ff; --am:#ffb02e; --gr:#3dffa0; --rd:#ff5470; --vi:#b78bff;
+  --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font:17px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;overflow-x:hidden}
+::selection{background:var(--cy);color:#000}
+a{color:var(--cy);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:880px;margin:0 auto;padding:0 24px}
+h2{font-size:clamp(28px,4.5vw,44px);line-height:1.15;letter-spacing:-.02em;margin-bottom:18px}
+h3{font-size:22px;margin:28px 0 10px}
+p{margin:14px 0;color:var(--tx)}
+.dim{color:var(--dim)}
+section{padding:90px 0;position:relative;content-visibility:auto;contain-intrinsic-size:auto 800px}
+.kicker{font:600 13px var(--mono);letter-spacing:.22em;text-transform:uppercase;color:var(--cy);margin-bottom:14px}
+.reveal{opacity:0;transform:translateY(26px);transition:all .8s cubic-bezier(.16,1,.3,1)}
+.reveal.on{opacity:1;transform:none}
+code,pre{font-family:var(--mono)}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;overflow-x:auto;font-size:14px;line-height:1.6;margin:18px 0}
+.c-k{color:var(--vi)} .c-s{color:var(--gr)} .c-c{color:var(--faint)} .c-f{color:var(--cy)}
+/* hero */
+#hero{content-visibility:visible;min-height:100svh;display:flex;flex-direction:column;justify-content:center;padding:60px 0}
+#net{position:fixed;inset:0;z-index:-1;opacity:.55}
+.h-title{font-size:clamp(42px,8vw,96px);line-height:1.02;letter-spacing:-.035em;font-weight:800}
+.h-title em{font-style:normal;background:linear-gradient(100deg,var(--cy),var(--vi) 60%,var(--am));-webkit-background-clip:text;background-clip:text;color:transparent}
+.h-sub{font-size:clamp(17px,2.4vw,23px);color:var(--dim);max-width:640px;margin-top:26px}
+.ticker{font:13px var(--mono);color:var(--am);margin-top:36px}
+.ticker b{color:var(--tx)}
+.scrolldown{position:absolute;bottom:28px;left:50%;transform:translateX(-50%);color:var(--faint);font:12px var(--mono);animation:bob 2s ease-in-out infinite}
+@keyframes bob{50%{transform:translate(-50%,8px)}}
+/* fossil cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:26px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+.card b{display:block;font-size:16px;margin-bottom:6px}
+.card span{color:var(--dim);font-size:14.5px}
+.strike{color:var(--rd);font:600 11px var(--mono);letter-spacing:.15em;text-transform:uppercase}
+/* brain stack */
+.stack{margin:34px 0;display:flex;flex-direction:column;gap:10px}
+.layer{border-radius:14px;padding:18px 22px;border:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:18px;background:var(--panel);transition:transform .3s,border-color .3s}
+.layer:hover{transform:translateX(8px)}
+.layer .nm{font:700 15px var(--mono)}
+.layer .role{font:600 11px var(--mono);letter-spacing:.18em;text-transform:uppercase;padding:4px 10px;border-radius:99px;white-space:nowrap}
+.layer .ds{color:var(--dim);font-size:14px;flex:1;text-align:right}
+.l1{border-left:4px solid var(--faint)} .l1 .role{background:#232c3c;color:#9fb0c6}
+.l2{border-left:4px solid var(--vi)} .l2 .role{background:#241a3f;color:var(--vi)}
+.l3{border-left:4px solid var(--am);box-shadow:0 0 34px -14px var(--am)} .l3 .role{background:#3a2a08;color:var(--am)}
+.l3.firing{animation:fire .5s}
+@keyframes fire{0%{box-shadow:0 0 60px -6px var(--am)}100%{box-shadow:0 0 34px -14px var(--am)}}
+/* playground */
+.play{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:18px;padding:26px;margin:26px 0}
+.play textarea{width:100%;background:#0a0e17;border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:14px;font:16px var(--mono);resize:vertical;min-height:64px}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+button{cursor:pointer;border:none;border-radius:10px;padding:11px 20px;font:600 14px var(--mono);transition:transform .12s,opacity .2s}
+button:active{transform:scale(.96)}
+.b-cy{background:var(--cy);color:#00222b}
+.b-gh{background:transparent;color:var(--dim);border:1px solid var(--line)}
+.b-rd{background:transparent;color:var(--rd);border:1px solid #3c1622}
+.b-am{background:var(--am);color:#2b1a00}
+.meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:20px}
+.meter{background:#0a0e17;border:1px solid var(--line);border-radius:10px;padding:14px}
+.meter .lab{font:600 10.5px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+.meter .val{font:700 26px var(--mono);margin-top:4px}
+canvas.chart{width:100%;height:120px;background:#0a0e17;border:1px solid var(--line);border-radius:10px;margin-top:14px}
+.genout{font:14px var(--mono);background:#0a0e17;border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px;min-height:52px;white-space:pre-wrap;word-break:break-all;color:var(--gr)}
+.note{font-size:13.5px;color:var(--faint);margin-top:12px}
+.gate{display:inline-block;font:600 11px var(--mono);padding:3px 10px;border-radius:99px;margin-left:8px;vertical-align:middle}
+.gate.open{background:#3a2a08;color:var(--am)} .gate.shut{background:#12202c;color:var(--dim)}
+/* dial */
+.dial{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:26px;margin:26px 0}
+input[type=range]{width:100%;accent-color:var(--cy);margin:14px 0}
+.dialrow{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:8px}
+.dialstat{flex:1;min-width:140px;background:#0a0e17;border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center}
+.dialstat .v{font:700 30px var(--mono)}
+.dialstat .l{font:600 10.5px var(--mono);letter-spacing:.15em;text-transform:uppercase;color:var(--dim)}
+.verdict{font:700 15px var(--mono);text-align:center;margin-top:16px;min-height:24px}
+/* numbers table */
+table{width:100%;border-collapse:collapse;margin:20px 0;font-size:15px}
+th,td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--line)}
+th{font:600 11px var(--mono);letter-spacing:.15em;text-transform:uppercase;color:var(--dim)}
+td b{color:var(--gr);font-family:var(--mono)}
+/* negatives */
+.neg{border-left:3px solid var(--rd);background:linear-gradient(90deg,#160d13,transparent);padding:16px 20px;border-radius:0 12px 12px 0;margin:14px 0}
+.neg b{color:var(--rd)}
+/* big quote */
+.bigq{font-size:clamp(24px,4vw,38px);line-height:1.3;letter-spacing:-.015em;font-weight:700;padding:40px 0;text-align:center}
+.bigq em{font-style:normal;color:var(--cy)}
+footer{padding:70px 0;border-top:1px solid var(--line);color:var(--faint);font-size:14px;text-align:center}
+.hr{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent);margin:0 auto;max-width:880px}
+@media(max-width:640px){.layer{flex-direction:column;align-items:flex-start}.layer .ds{text-align:left}}
+@media (prefers-reduced-motion:reduce){.reveal{transition:none;opacity:1;transform:none}.scrolldown{animation:none}#net{display:none}}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.chip{background:#0a0e17;border:1px solid var(--line);color:var(--dim);border-radius:99px;padding:6px 14px;font:600 12px var(--mono)}
+.chip:hover{color:var(--cy);border-color:var(--cy)}
+.probwrap{margin-top:14px}
+.problab{font:600 10.5px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.probbar{display:flex;height:34px;border-radius:10px;overflow:hidden;border:1px solid var(--line);background:#0a0e17}
+.probbar div{display:flex;align-items:center;justify-content:center;font:700 12px var(--mono);color:#00222b;min-width:0;overflow:hidden;white-space:nowrap;transition:flex-basis .4s ease}
+.dots{position:fixed;right:16px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:10px;z-index:5}
+.dots a{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:all .3s;display:block}
+.dots a.on{background:var(--cy);transform:scale(1.5)}
+@media(max-width:900px){.dots{display:none}}
+.miniCta{position:fixed;bottom:14px;left:50%;transform:translate(-50%,120px);z-index:9;background:var(--cy);color:#00222b;font:700 13px var(--mono);padding:10px 18px;border-radius:99px;box-shadow:0 8px 30px -8px var(--cy);transition:transform .4s cubic-bezier(.16,1,.3,1);white-space:nowrap}
+.miniCta.show{transform:translate(-50%,0)}
+@media(min-width:900px){.miniCta{display:none}}
+@media print{#net,.dots,.miniCta,.scrolldown,button,.chips{display:none!important}body{background:#fff;color:#111}section{padding:20px 0;page-break-inside:avoid}.reveal{opacity:1;transform:none}pre,.play,.dial{border:1px solid #ccc;background:#f7f7f7}}
+</style>
+</head>
+<body>
+<canvas id="net"></canvas>
+<noscript><div style="max-width:800px;margin:40px auto;padding:20px;border:1px solid #333;border-radius:12px;font-family:monospace">
+JavaScript is off — so the live self-learning model in this page can't run.
+The short version: frozen Qwen3-VL-2B + merged strands LoRA + a plastic fast-weight head that
+updates at inference (surprise-gated SGD, EMA decay, provable reset). NLL 6.18→5.37 while running,
+base drift −0.01, reset Δlogits = 0. Code: github.com/cagataycali/slm</div></noscript>
+<nav class="dots" aria-label="sections"><a href="#hero" data-s="hero"></a><a href="#problem" data-s="problem"></a><a href="#idea" data-s="idea"></a><a href="#play" data-s="play"></a><a href="#dialsec" data-s="dialsec"></a><a href="#proof" data-s="proof"></a><a href="#negatives" data-s="negatives"></a><a href="#closer" data-s="closer"></a></nav>
+
+<!-- ============ HERO ============ -->
+<section id="hero"><div class="wrap">
+  <div class="kicker">slm · self-learning model</div>
+  <h1 class="h-title">The model that is<br><em>never done training.</em></h1>
+  <p class="h-sub">Every LLM you've ever used is frozen at birth — trained once, shipped, fossilized.
+  This one <b style="color:var(--tx)">rewrites its own weights while it runs</b>.
+  There's a live one in this page. Scroll.</p>
+  <div class="ticker" style="min-height:20px"><span id="typew" style="color:var(--cy)"></span><span style="animation:bob 1s steps(2) infinite">▮</span></div>
+  <div class="ticker">weights updated by the model living in this page: <b id="tickN">0</b></div>
+</div><div class="scrolldown">▼ scroll</div></section>
+
+<!-- ============ THE PROBLEM ============ -->
+<section id="problem"><div class="wrap reveal">
+  <div class="kicker">01 · the problem</div>
+  <h2>Deployment is a funeral.</h2>
+  <p>The moment a model ships, it stops learning. Every conversation, every correction,
+  every new fact it meets — evaporates when the context window ends. The industry's fixes are prosthetics:</p>
+  <div class="cards">
+    <div class="card"><span class="strike">prosthetic</span><b>RAG</b><span>Notes taped to the model's forehead. Retrieval, not knowledge.</span></div>
+    <div class="card"><span class="strike">prosthetic</span><b>Long context</b><span>A bigger forehead.</span></div>
+    <div class="card"><span class="strike">prosthetic</span><b>Fine-tuning</b><span>Ship the fossil back to the factory.</span></div>
+  </div>
+  <p class="dim">None of them change the model. Experience should leave a mark.</p>
+</div></section>
+
+<!-- ============ THE IDEA ============ -->
+<section style="background:var(--bg2)" id="idea"><div class="wrap reveal">
+  <div class="kicker">02 · the idea</div>
+  <h2>Three layers of memory.<br>Like a brain.</h2>
+  <div class="stack">
+    <div class="layer l1"><span class="nm">frozen Qwen3-VL-2B</span><span class="ds">never updated. can't forget. ever.</span><span class="role">instinct</span></div>
+    <div class="layer l2"><span class="nm">+ strands LoRA (merged)</span><span class="ds">slow knowledge, consolidated offline</span><span class="role">cortex</span></div>
+    <div class="layer l3" id="hippo"><span class="nm">+ plastic head</span><span class="ds">fast weights — rewritten <b>at inference</b></span><span class="role">hippocampus</span></div>
+  </div>
+  <p>The loss signal is the deepest part: <b>next-observation prediction error</b>.
+  No labels. No reward model. No human feedback. The model predicts what comes next,
+  gets <span style="color:var(--am)">surprised</span>, and rewrites a small bounded piece of itself.</p>
+  <p class="bigq">Reality is <em>the teacher.</em></p>
+<pre><span class="c-c"># the whole loop</span>
+<span class="c-k">for</span> observation <span class="c-k">in</span> reality:
+    surprise = -log p(observation)      <span class="c-c"># predict → measure error</span>
+    <span class="c-k">if</span> surprise &gt; expected:             <span class="c-c"># surprise gate</span>
+        fast_weights -= lr * grad       <span class="c-c"># rewrite yourself</span>
+        fast_weights *= decay           <span class="c-c"># bounded — never drift far</span></pre>
+</div></section>
+
+<!-- ============ LIVE PLAYGROUND ============ -->
+<section id="play"><div class="wrap reveal">
+  <div class="kicker">03 · don't take our word for it</div>
+  <h2>A self-learning model is running<br>in this page. Teach it.</h2>
+  <p class="dim">This is a real fast-weight character model (vanilla JS, ~200 lines, the same
+  surprise-gate + decay + reset mechanism as the 2B system — miniaturized). It was born knowing nothing.</p>
+  <div class="play">
+    <div class="chips">
+      <button class="chip" data-t="the codename of our project is BLUEHERON. ">codename fact</button>
+      <button class="chip" data-t="the staging server region is eu-north-1. ">infra fact</button>
+      <button class="chip" data-t="strands agents turns python functions into tools. ">strands fact</button>
+      <button class="chip" data-t="never gonna give you up. never gonna let you down. ">a classic</button>
+    </div>
+    <textarea id="teachTxt" aria-label="text to teach the model">the codename of our project is BLUEHERON. the codename of our project is BLUEHERON.</textarea>
+    <div class="btnrow">
+      <button class="b-cy" id="btnObserve">observe(learn=True)</button>
+      <span style="display:inline-flex"><input id="genPrompt" value="the codename" aria-label="generation prompt" style="background:#0a0e17;border:1px solid var(--line);border-right:none;color:var(--gr);border-radius:10px 0 0 10px;padding:0 12px;font:600 13px var(--mono);width:150px"><button class="b-am" id="btnGen" style="border-radius:0 10px 10px 0">generate →</button></span>
+      <button class="b-rd" id="btnReset">reset() — the off-switch</button>
+      <button class="b-gh" id="btnAuto">▶ auto-stream ×20</button>
+      <button class="b-gh" id="btnShare" onclick="shareURL()">⧉ share this brain</button>
+      <button class="b-gh" id="btnSave">💾 save brain</button>
+      <button class="b-gh" id="btnLoad">📂 load brain</button>
+      <label style="display:inline-flex;align-items:center;gap:6px;font:600 12px var(--mono);color:var(--dim);cursor:pointer"><input type="checkbox" id="tempChk" style="accent-color:var(--am)"> sample (T=0.7)</label>
+      <label style="display:inline-flex;align-items:center;gap:6px;font:600 12px var(--mono);color:var(--dim);cursor:pointer"><input type="checkbox" id="liveChk" style="accent-color:var(--cy)"> learn as I type</label>
+    </div>
+    <div class="meters">
+      <div class="meter"><div class="lab">surprise (nll/char)</div><div class="val" id="mSurp" style="color:var(--am)">—</div></div>
+      <div class="meter"><div class="lab">weight updates</div><div class="val" id="mUpd" style="color:var(--cy)">0</div></div>
+      <div class="meter"><div class="lab">gate <span class="gate shut" id="mGate">closed</span></div><div class="val" id="mMean">—</div></div>
+      <div class="meter"><div class="lab">‖fast weights‖</div><div class="val" id="mNorm" style="color:var(--vi)">0.00</div></div>
+    </div>
+    <canvas class="chart" id="memMap" style="height:80px" title="each column = a learned context; brightness = weight magnitude"></canvas>
+    <div class="probwrap"><div class="problab">live belief — P(next char) after "<span id="probCtx">the</span>"</div>
+    <div class="probbar" id="probBar"></div></div>
+    <canvas class="chart" id="surpChart"></canvas>
+    <div class="genout" id="genOut">→ press observe a few times, then generate. watch it get less surprised — that IS learning.</div>
+    <div class="note">⌨ shortcuts: <b>o</b>bserve · <b>g</b>enerate · <b>r</b>eset. Everything happens in your browser. Refresh = lobotomy (unless you 💾 save the brain). That's the point:
+    weights are the only memory here — no context window, no retrieval, no tricks.
+    <b>reset()</b> provably zeroes the fast weights (the same off-switch guarantee as the 2B model: Δlogits = 0).</div>
+  </div>
+</div></section>
+
+<!-- ============ THE DIAL ============ -->
+<section style="background:var(--bg2)" id="dialsec"><div class="wrap reveal">
+  <div class="kicker">04 · the 50-year-old problem, as one knob</div>
+  <h2>Stability ↔ plasticity.<br>We measured the dial.</h2>
+  <p>Learn new things, or keep the old ones — neuroscience's classic dilemma. On a real 2B model,
+  it reduces to <b>EMA decay on the fast weights</b>. Drag it. These are our actual measurements:</p>
+  <div class="dial">
+    <div style="display:flex;justify-content:space-between;font:600 12px var(--mono);color:var(--dim)">
+      <span>← MAX PLASTICITY (no decay)</span><span>MAX STABILITY (frozen) →</span></div>
+    <input type="range" id="dial" min="0" max="100" value="62" aria-label="stability plasticity dial">
+    <div style="display:flex;justify-content:space-between;font:11px var(--mono);color:var(--faint)">
+      <span>lr 1e-2 · no decay</span><span>lr 8e-3 · decay 0.98</span><span>lr 2e-3</span><span>frozen</span></div>
+    <div class="dialrow">
+      <div class="dialstat"><div class="v" id="dGain" style="color:var(--gr)">+0.89</div><div class="l">learning gain (nll)</div></div>
+      <div class="dialstat"><div class="v" id="dForget" style="color:var(--rd)">+0.03</div><div class="l">forgetting (base)</div></div>
+    </div>
+    <div class="verdict" id="dVerdict" style="color:var(--gr)">the sweet spot — learns AND retains (lr 8e-3, decay 0.98)</div>
+  </div>
+  <p class="dim">Without the decay: gain +3.3 but forgetting +7.09 — the model lobotomizes itself.
+  With decay 0.98: gain +0.89, base drift +0.03. One knob resolves the dilemma.</p>
+</div></section>
+
+<!-- ============ PROOF ============ -->
+<section id="proof"><div class="wrap reveal">
+  <div class="kicker">05 · receipts</div>
+  <h2>Real numbers. Single GPU.<br>Reproducible.</h2>
+  <table>
+    <tr><th>claim</th><th>evidence</th></tr>
+    <tr><td>It's a domain expert</td><td>strands probe NLL <b>4.85 → 2.22</b>, 8/8 improved</td></tr>
+    <tr><td><b style="color:var(--cy)">It learns while running</b></td><td>continual OOD stream NLL <b>6.18 → 5.37</b>, pure inference</td></tr>
+    <tr><td>It doesn't forget</td><td>base expertise during OOD learning: <b>Δ −0.01</b></td></tr>
+    <tr><td>Watchable, live</td><td>P(correct) <b>0.09 → 0.74</b> in demo.ipynb, greedy 3/3</td></tr>
+    <tr><td>Agent turns → weight change</td><td>P(fact) <b>0.002 → 0.571</b> over 8 strands-agent turns</td></tr>
+    <tr><td>Provable off-switch</td><td>reset() → bit-identical to base, <b>Δlogits = 0</b></td></tr>
+  </table>
+<pre><span class="c-c"># pip install strands-slm</span>
+<span class="c-k">from</span> strands <span class="c-k">import</span> Agent
+<span class="c-k">from</span> slm <span class="c-k">import</span> SLM
+
+agent = Agent(model=SLM(<span class="c-s">"cagataydev/strands-qwen3-vl-2b"</span>))
+agent(<span class="c-s">"..."</span>)   <span class="c-c"># ← this turn PHYSICALLY changed the model's weights</span></pre>
+</div></section>
+
+<!-- ============ HONEST NEGATIVES ============ -->
+<section style="background:var(--bg2)" id="negatives"><div class="wrap reveal">
+  <div class="kicker">06 · what we could NOT do</div>
+  <h2>The negatives are the science.</h2>
+  <p>Two independent experiment tracks — run blind to each other — hit the identical wall:</p>
+  <div class="neg"><b>Memorization ≠ knowledge.</b> Fast-weight NLL gains grow huge (+1.4) while generated
+  answers get <i>worse</i>. Probability mass moves toward the fact; the argmax stays captured by the prior.</div>
+  <div class="neg"><b>Sequential facts interfere.</b> Teaching fact 2 crashes fact 1: P 0.571 → 0.090 at high plasticity.</div>
+  <div class="neg"><b>A single plastic layer can't store facts.</b> It reshapes output priors; retrievable
+  knowledge lives in mid-layer MLPs. Rehearsal on unrelated text doesn't save it — the interference
+  is in the shared low-rank subspace.</div>
+  <div class="play" style="margin-top:22px">
+    <div class="problab" style="margin-bottom:10px">⚗ REPRODUCE THE NEGATIVE — right here, with the page-model</div>
+    <p class="dim" style="margin:0 0 12px;font-size:14.5px">Teach it fact A until mastered, then hammer fact B, then ask about A again.
+    Watch high plasticity overwrite — the same interference we measured on the 2B model (P: 0.571 → 0.090).</p>
+    <div class="btnrow" style="margin-top:0">
+      <button class="b-cy" id="btnInterfere">▶ run interference experiment</button>
+    </div>
+    <div class="genout" id="intOut">→ 30 observations of A, 30 of B, then recall A. no tricks — it runs the model above.</div>
+  </div>
+  <p>And the deepest finding: making test-time learning store <i>durable</i> knowledge requires
+  multi-layer placement + replay + consolidation… <b>which is distillation, running continuously.</b></p>
+  <p class="bigq">Fast weights catch experience.<br>Slow weights consolidate it.<br><em>Wake and sleep.</em></p>
+  <p class="dim" style="text-align:center">Biology needed both. Now we've measured why.</p>
+</div></section>
+
+<!-- ============ CLOSER ============ -->
+<section id="closer"><div class="wrap reveal" style="text-align:center">
+  <div class="kicker" style="text-align:center">07 · why this matters</div>
+  <h2>Models as living systems,<br>not artifacts.</h2>
+  <p class="dim" style="max-width:620px;margin:16px auto">Every agent framework improves by changing prompts, tools, retrieval.
+  This is the first where <b style="color:var(--tx)">using the agent changes its weights</b>. Run it for a month
+  and it's no longer the model you downloaded — it's <i>your</i> model. With a reset button,
+  and an audit log of every surprise that changed it.</p>
+  <p class="bigq">The thing that comes after<br><em>"training runs."</em></p>
+  <div class="btnrow" style="justify-content:center">
+    <a href="https://github.com/cagataycali/slm"><button class="b-cy">github.com/cagataycali/slm</button></a>
+    <a href="https://github.com/cagataycali/slm/blob/main/README.md"><button class="b-gh">full results (incl. negatives)</button></a>
+    <a href="https://github.com/cagataycali/slm/blob/main/demo.ipynb"><button class="b-gh">demo.ipynb</button></a>
+  </div>
+</div></section>
+
+<a class="miniCta" id="miniCta" href="#play">teach the live model</a>
+<footer>slm · MIT · built on <a href="https://github.com/strands-agents">strands-agents</a> ·
+model: <a href="https://huggingface.co/cagataydev/strands-qwen3-vl-2b">cagataydev/strands-qwen3-vl-2b</a><br>
+<span style="opacity:.6">the tiny model in section 03 learned <span id="footN">0</span> times while you read this page.</span></footer>
+
+<script>
+/* easter egg: press "a" 3x fast (outside inputs) -> autonomous mode: the page reads its own copy to the model */
+(()=>{let taps=[],running=false;
+addEventListener('keydown',async e=>{
+  if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT'||e.key!=='a')return;
+  const now=Date.now();taps=taps.filter(t=>now-t<900);taps.push(now);
+  if(taps.length<3||running)return;running=true;taps=[];
+  const secs=[...document.querySelectorAll('section p')].map(p=>p.textContent).filter(t=>t.length>60);
+  const out=document.getElementById('genOut');
+  out.textContent='🤖 AUTONOMOUS MODE — the page is reading itself to the model ('+secs.length+' paragraphs)…';
+  document.getElementById('play').scrollIntoView({behavior:'smooth'});
+  for(let i=0;i<secs.length;i++){const r=M.observe(secs[i].toLowerCase(),true);refresh(r);
+    out.textContent='🤖 reading paragraph '+(i+1)+'/'+secs.length+' — surprise '+(r?r.e.toFixed(2):'—');
+    await new Promise(r=>setTimeout(r,160));}
+  out.textContent='🤖 done. the page-model has now read this page. try generate("the model") — it speaks in the page\'s own voice. (press a×3 to run again)';
+  running=false;});})();
+/* typewriter */
+(()=>{const L=["surprise-gated. bounded. provably resettable.","NLL 6.18 → 5.37 while running. Δ base −0.01.","reset() → Δlogits = 0. bit-exact.","pip install strands-slm","the weights are the memory."];
+let li=0,ci=0,del=false;const el=document.getElementById('typew');
+(function tick(){const t=L[li];
+  el.textContent=t.slice(0,ci);
+  if(!del){ci++;if(ci>t.length+14){del=true}}
+  else{ci--;if(ci===0){del=false;li=(li+1)%L.length}}
+  setTimeout(tick,del?18:(ci>t.length?60:42))})()})();
+/* ============ reveal on scroll ============ */
+const io=new IntersectionObserver(es=>es.forEach(e=>e.isIntersecting&&e.target.classList.add('on')),{threshold:.12});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+/* ============ neural background ============ */
+(()=>{const c=document.getElementById('net'),x=c.getContext('2d');let W,H,pts=[];
+function rs(){W=c.width=innerWidth;H=c.height=innerHeight;pts=Array.from({length:Math.min(70,W/18)},()=>({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.35,vy:(Math.random()-.5)*.35}))}
+rs();addEventListener('resize',rs);
+let pulse=0;window._pulse=()=>pulse=1;
+(function loop(){x.clearRect(0,0,W,H);pulse*=.94;
+for(const p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>W)p.vx*=-1;if(p.y<0||p.y>H)p.vy*=-1}
+for(let i=0;i<pts.length;i++)for(let j=i+1;j<pts.length;j++){const a=pts[i],b=pts[j],d=Math.hypot(a.x-b.x,a.y-b.y);
+if(d<150){x.strokeStyle=`rgba(${pulse>0.05?'255,176,46':'56,225,255'},${(1-d/150)*(.10+pulse*.5)})`;x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);x.stroke()}}
+for(const p of pts){x.fillStyle=`rgba(56,225,255,${.5+pulse*.5})`;x.beginPath();x.arc(p.x,p.y,1.6+pulse*2,0,7);x.fill()}
+document.hidden?setTimeout(loop,400):requestAnimationFrame(loop)})()})();
+
+/* ============ THE LIVE SELF-LEARNING MODEL ============
+   A real fast-weight character LM: logits = fastW[trigram-context][char].
+   observe(): surprise = mean NLL; surprise gate (EMA mean); SGD on softmax CE;
+   EMA decay on all fast weights; reset() zeroes everything. Same mechanism
+   as the 2B system, miniaturized. No context window. Weights ARE the memory. */
+const AZ="abcdefghijklmnopqrstuvwxyz0123456789 .";const V=AZ.length;
+const enc=s=>[...s.toLowerCase()].map(ch=>{const i=AZ.indexOf(ch);return i<0?V-2:i});
+class TinySLM{
+  constructor(){this.W=new Map();this.mean=null;this.beta=.9;this.lr=.5;this.decay=.995;this.k=0;this.updates=0;this.hist=[]}
+  key(a,b,c){return (a*V+b)*V+c}
+  logits(k){let w=this.W.get(k);if(!w){w=new Float32Array(V);this.W.set(k,w)}return w}
+  probs(k){const w=this.logits(k),m=Math.max(...w);let s=0;const e=new Float32Array(V);
+    for(let i=0;i<V;i++){e[i]=Math.exp(w[i]-m);s+=e[i]}for(let i=0;i<V;i++)e[i]/=s;return e}
+  observe(text,learn=true){const t=enc(text);if(t.length<4)return null;let nll=0,n=0;
+    for(let i=3;i<t.length;i++){const k=this.key(t[i-3],t[i-2],t[i-1]),p=this.probs(k);
+      nll+=-Math.log(p[t[i]]+1e-9);n++}
+    const e=nll/n;
+    const fire=this.mean===null||e>0.30||e>this.mean+this.k*Math.abs(this.mean);  // floor: keep learning while still surprised (>0.30 nll/char); gate closes once mastered
+    this.mean=this.mean===null?e:this.beta*this.mean+(1-this.beta)*e;
+    if(learn&&fire){
+      for(let i=3;i<t.length;i++){const k=this.key(t[i-3],t[i-2],t[i-1]),p=this.probs(k),w=this.logits(k);
+        for(let j=0;j<V;j++)w[j]-=this.lr*(p[j]-(j===t[i]?1:0));}
+      for(const w of this.W.values())for(let j=0;j<V;j++)w[j]*=this.decay;
+      this.updates++;}
+    this.hist.push(e);if(this.hist.length>120)this.hist.shift();
+    return {e,fire};}
+  generate(prompt,n=42,temp=0){let t=enc(prompt);const out=[];
+    for(let s=0;s<n;s++){const k=this.key(t[t.length-3],t[t.length-2],t[t.length-1]),p=this.probs(k);
+      let pick=0;
+      if(temp>0){let r=Math.random(),acc=0;const q=[...p].map(v=>Math.pow(v,1/temp));
+        const Z=q.reduce((a,b)=>a+b,0);for(let j=0;j<V;j++){acc+=q[j]/Z;if(r<=acc){pick=j;break}}}
+      else{for(let j=1;j<V;j++)if(p[j]>p[pick])pick=j}   // greedy
+      out.push(AZ[pick]);t.push(pick)}
+    return prompt+"│"+out.join("")}
+  norm(){let s=0;for(const w of this.W.values())for(const v of w)s+=v*v;return Math.sqrt(s)}
+  reset(){this.W.clear();this.mean=null;this.updates=0;this.hist=[]}
+}
+const M=new TinySLM();
+const $=id=>document.getElementById(id);
+let totalTicks=0;
+function paintChart(){const c=$('surpChart'),x=c.getContext('2d');
+  c.width=c.clientWidth*2;c.height=c.clientHeight*2;x.clearRect(0,0,c.width,c.height);
+  const h=M.hist;if(!h.length)return;const mx=Math.max(...h,1e-9);
+  x.beginPath();x.strokeStyle='#ffb02e';x.lineWidth=3;
+  h.forEach((v,i)=>{const px=i/(Math.max(h.length-1,1))*c.width,py=c.height-(v/mx)*c.height*.86-8;
+    i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();
+  x.fillStyle='#7b8aa0';x.font='20px monospace';x.fillText('surprise over observations →',16,28);}
+function refresh(r){if(r){$('mSurp').textContent=r.e.toFixed(3);
+  const g=$('mGate');g.textContent=r.fire?'OPEN — learning':'closed';g.className='gate '+(r.fire?'open':'shut');
+  if(r.fire){$('hippo').classList.remove('firing');void $('hippo').offsetWidth;$('hippo').classList.add('firing');window._pulse()}}
+  $('mUpd').textContent=M.updates;$('mMean').textContent=M.mean?M.mean.toFixed(2):'—';
+  $('mNorm').textContent=M.norm().toFixed(1);
+  $('tickN').textContent=$('footN').textContent=M.updates;paintChart();try{paintProbs();paintMem()}catch(_){}}
+$('btnObserve').onclick=()=>refresh(M.observe($('teachTxt').value));
+$('btnGen').onclick=()=>{const pr=($('genPrompt').value||'the codename').slice(0,60);
+  $('genOut').textContent='generate("'+pr+'") → '+M.generate(pr,42,$('tempChk').checked?0.7:0)+
+  (M.updates<3?'\n\n(mostly noise — it has barely learned. observe more, then retry.)':'')};
+$('btnReset').onclick=()=>{M.reset();refresh(null);$('mSurp').textContent='—';
+  $('genOut').textContent='→ fast weights zeroed. ‖W‖ = 0. it remembers NOTHING. that is the off-switch guarantee.'};
+$('btnAuto').onclick=async()=>{for(let i=0;i<20;i++){refresh(M.observe($('teachTxt').value));await new Promise(r=>setTimeout(r,90))}};
+paintChart();addEventListener('resize',paintChart);
+function paintMem(){const c=$('memMap'),x=c.getContext('2d');
+  c.width=c.clientWidth*2;c.height=c.clientHeight*2;x.clearRect(0,0,c.width,c.height);
+  x.fillStyle='#7b8aa0';x.font='20px monospace';
+  const ks=[...M.W.keys()];
+  if(!ks.length){x.fillText('the fast weights — empty. nothing learned yet.',16,c.height/2);return}
+  x.fillText('the fast weights themselves — '+ks.length+' learned contexts',16,26);
+  const cw=Math.max(3,Math.min(14,c.width/ks.length));
+  ks.forEach((k,i)=>{const w=M.W.get(k);let mx=0;for(const v of w)mx=Math.max(mx,Math.abs(v));
+    const hue=195+Math.min(mx*9,60);
+    x.fillStyle='hsl('+hue+' 90% '+(25+Math.min(mx*12,45))+'%)';
+    x.fillRect(i*cw,40,cw-1,c.height-48)});}
+const PCOLORS=['#38e1ff','#3dffa0','#ffb02e','#b78bff','#ff5470'];
+function paintProbs(){const pr=($('genPrompt').value||'the codename').slice(0,60);const t=enc(pr);
+  if(t.length<3)return;$('probCtx').textContent=pr.slice(-8);
+  const p=M.probs(M.key(t[t.length-3],t[t.length-2],t[t.length-1]));
+  const idx=[...p.keys()].sort((a,b)=>p[b]-p[a]).slice(0,5);
+  const bar=$('probBar');bar.innerHTML='';
+  idx.forEach((j,r)=>{const d=document.createElement('div');
+    d.style.flex=(Math.max(p[j],.02)*100)+' 1 0';d.style.background=PCOLORS[r];
+    d.textContent=(AZ[j]===' '?'␣':AZ[j])+' '+(p[j]*100).toFixed(0)+'%';bar.appendChild(d)});}
+paintProbs();$('genPrompt').addEventListener('input',paintProbs);paintMem();addEventListener('resize',paintMem);
+// save/load fast weights — the page-model version of save_fast_weights()
+$('btnSave').onclick=()=>{const o={};for(const[k,w]of M.W)o[k]=[...w];
+  localStorage.setItem('slm_brain',JSON.stringify({W:o,mean:M.mean,updates:M.updates}));
+  $('genOut').textContent='→ brain saved to localStorage ('+M.W.size+' contexts, '+M.updates+' updates). survives refresh now — just like save_fast_weights("exp.pt").'};
+$('btnLoad').onclick=()=>{const raw=localStorage.getItem('slm_brain');
+  if(!raw){$('genOut').textContent='→ no saved brain found. teach it something, then 💾 save.';return}
+  const d=JSON.parse(raw);M.W.clear();
+  for(const k in d.W)M.W.set(+k,Float32Array.from(d.W[k]));
+  M.mean=d.mean;M.updates=d.updates;refresh(null);
+  $('genOut').textContent='→ brain restored: '+M.W.size+' contexts, '+M.updates+' updates. it remembers.'};
+// share: encode teach-text in URL hash
+if(location.hash.length>1){try{const h=JSON.parse(decodeURIComponent(atob(location.hash.slice(1))));
+  if(h.t)$('teachTxt').value=h.t;if(h.n)setTimeout(async()=>{for(let i=0;i<Math.min(h.n,40);i++){refresh(M.observe($('teachTxt').value,true));await new Promise(r=>setTimeout(r,50))}},600);}catch(_){}}
+function shareURL(){const st=btoa(encodeURIComponent(JSON.stringify({t:$('teachTxt').value,n:M.updates})));
+  const u=location.origin+location.pathname+'#'+st;navigator.clipboard&&navigator.clipboard.writeText(u);
+  $('genOut').textContent='→ share link copied. anyone who opens it gets a fresh model that auto-learns your text ('+M.updates+' observations replayed).\n'+u.slice(0,90)+'…';}
+let liveT=null;
+$('teachTxt').addEventListener('input',()=>{if(!$('liveChk').checked)return;
+  clearTimeout(liveT);liveT=setTimeout(()=>refresh(M.observe($('teachTxt').value,true)),350)});
+$('genPrompt').addEventListener('keydown',e=>{if(e.key==='Enter')$('btnGen').click()});
+addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT')return;
+  if(e.key==='o')$('btnObserve').click();if(e.key==='g')$('btnGen').click();if(e.key==='r')$('btnReset').click()});
+$('btnInterfere').onclick=async()=>{
+  const A='the codename of our project is blueheron. ';
+  const B='the database password is tangerine42. ';
+  const o=$('intOut');M.reset();refresh(null);
+  o.textContent='teaching fact A ...';
+  for(let i=0;i<30;i++){refresh(M.observe(A,true));if(i%6==0)await new Promise(r=>setTimeout(r,60))}
+  const recA1=M.generate('the codename',40);
+  o.textContent='A learned → '+recA1+'\n\nnow hammering fact B ...';
+  await new Promise(r=>setTimeout(r,500));
+  for(let i=0;i<30;i++){refresh(M.observe(B,true));if(i%6==0)await new Promise(r=>setTimeout(r,60))}
+  const recA2=M.generate('the codename',40);
+  const kept=recA2.toLowerCase().includes('blueheron');
+  o.textContent='A after learning:  '+recA1+'\nA after B hammered: '+recA2+'\n\n'+
+    (kept?'A survived — trigram contexts barely overlap here. on the 2B model the shared low-rank subspace makes this fail (P 0.571→0.090). scale changes the answer — that is the finding.'
+         :'A got overwritten — the same interference we measured on the 2B model (P 0.571→0.090). memorization ≠ durable knowledge.');};
+document.querySelectorAll('.chip').forEach(ch=>ch.onclick=()=>{$('teachTxt').value=ch.dataset.t.repeat(2).trim()});
+
+/* ============ stability-plasticity dial (real measured anchor points) ============ */
+/* anchors: (plasticity p: 1=no decay ... 0=frozen) -> [gain, forget], from README.md */
+const anchors=[[1.00,3.3,7.09],[0.62,0.89,0.03],[0.35,0.19,-0.01],[0.15,0.05,0.00],[0.0,0.0,0.0]];
+function lerpRow(p){for(let i=0;i<anchors.length-1;i++){const a=anchors[i],b=anchors[i+1];
+  if(p<=a[0]&&p>=b[0]){const t=(p-b[0])/(a[0]-b[0]+1e-9);
+    return [b[1]+t*(a[1]-b[1]),b[2]+t*(a[2]-b[2])]}}return [0,0]}
+const dial=$('dial');
+function setDial(){const p=1-dial.value/100;const [g,f]=lerpRow(p);
+  $('dGain').textContent='+'+g.toFixed(2);$('dForget').textContent=(f>=0?'+':'')+f.toFixed(2);
+  const v=$('dVerdict');
+  if(f>1){v.style.color='var(--rd)';document.body.style.setProperty('--rd','#ff5470');v.textContent='lobotomy — crushes the new data, destroys the base (lr 1e-2, no decay)'}
+  else if(g<0.1){v.style.color='var(--dim)';v.textContent='🧊 basically frozen — safe but barely learns'}
+  else if(g>0.5&&f<0.1){v.style.color='var(--gr)';v.textContent='the sweet spot — learns AND retains (lr 8e-3, decay 0.98)'}
+  else{v.style.color='var(--am)';v.textContent='⚠️ trading base knowledge for learning speed'}}
+dial.oninput=setDial;dial.value=38;setDial();
+const dio=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){
+  document.querySelectorAll('.dots a').forEach(a=>a.classList.toggle('on',a.dataset.s===e.target.id))}}),{threshold:.4});
+document.querySelectorAll('section').forEach(sec=>dio.observe(sec));
+const mc=document.getElementById('miniCta');
+const mio=new IntersectionObserver(es=>es.forEach(e=>mc.classList.toggle('show',!e.isIntersecting&&scrollY>400)),{threshold:.05});
+mio.observe(document.getElementById('play'));
+</script>
+</body>
+</html>

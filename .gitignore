@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+artifacts/
+scripts/corpus_raw/
+scripts/corpus.jsonl
+*.pt
+.DS_Store

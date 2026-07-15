@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strands-slm"
+version = "0.1.0"
+description = "Self-learning model: a Strands-Agents-expert Qwen3-VL-2B whose weights keep changing at inference — surprise-gated, bounded, with a provable off-switch."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "cagataycali"}]
+keywords = ["test-time-learning", "continual-learning", "fast-weights", "lora", "qwen", "strands-agents", "self-learning"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+train = ["peft>=0.10", "accelerate"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/cagataycali/slm"
+Repository = "https://github.com/cagataycali/slm"
+
+[tool.setuptools.packages.find]
+include = ["slm*"]

@@ -8,7 +8,8 @@ Output: corpus.jsonl — one {"text": ..., "source": ...} per document.
 Markdown files are kept whole (docs = highest value). Python files get a
 path header so the model learns the package layout. Large/generated files skipped.
 """
-import os, json, sys
+import os
+import json
 
 RAW = os.path.join(os.path.dirname(__file__), "corpus_raw")
 OUT = os.path.join(os.path.dirname(__file__), "corpus.jsonl")

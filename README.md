@@ -1,4 +1,9 @@
-# slm
+# slm — self-learning model
+
+[![PyPI](https://img.shields.io/pypi/v/strands-slm.svg)](https://pypi.org/project/strands-slm/)
+[![Python](https://img.shields.io/pypi/pyversions/strands-slm.svg)](https://pypi.org/project/strands-slm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Model](https://img.shields.io/badge/%F0%9F%A4%97%20model-strands--qwen3--vl--2b-yellow)](https://huggingface.co/cagataydev/strands-qwen3-vl-2b)
 
 **A model whose weights change while it runs.**
 Predict, get surprised, rewrite a small bounded part of yourself, never forget the base.
@@ -7,9 +12,15 @@ Every LLM you have used is frozen at deployment. `slm` wraps a frozen
 [Qwen3-VL-2B post-tuned on the strands-agents codebase](https://huggingface.co/cagataydev/strands-qwen3-vl-2b)
 with a plastic layer that keeps learning at inference — with a provable off-switch.
 
+> **For** agent builders and continual-learning researchers who want a model that
+> adapts *after* deployment. **Runs on** one GPU (validated on an L40S; CPU works
+> for smoke tests). ~1.6M plastic params over a frozen 2.13B base.
+
 ```bash
 pip install strands-slm
 ```
+
+**Contents:** [Quickstart](#quickstart) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
 
 ## Quickstart
 
@@ -39,10 +50,14 @@ for doc in your_stream:
 m.reset()                        # bit-exact back to the base
 ```
 
-**See it happen: [demo.ipynb](demo.ipynb)** — ask the model a question it cannot
-know, let it read documents (pure inference), ask again — it knows. Then reset,
-and it forgets. Executed outputs and plots embedded; validated on an L40S:
-P(correct) 0.09 → 0.74, greedy answers 3/3, reset Δlogits = 0.
+**See it happen: [demo.ipynb](demo.ipynb)**
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cagataycali/slm/blob/main/demo.ipynb)
+· [view on nbviewer](https://nbviewer.org/github/cagataycali/slm/blob/main/demo.ipynb)
+
+Ask the model a question it cannot know, let it read documents (pure inference),
+ask again — it knows. Then reset, and it forgets. Executed outputs and plots
+embedded; validated on an L40S: P(correct) 0.09 → 0.74, greedy answers 3/3,
+reset Δlogits = 0.
 
 ## How it works
 
@@ -133,6 +148,19 @@ python scripts/eval_strands.py       # base vs tuned probes
 
 Private HF repos need `HF_TOKEN` in the environment, or pass `token=`.
 
+## Citation
+
+If you use `slm` in your research, please cite:
+
+```bibtex
+@software{slm2025,
+  title  = {slm: a self-learning Strands-Agents model with a provable off-switch},
+  author = {Cali, Cagatay},
+  year   = {2025},
+  url    = {https://github.com/cagataycali/slm}
+}
+```
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

@@ -372,11 +372,15 @@ class StrandsPlasticQwen:
         if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
             ids = ids["input_ids"]
         ids = ids.to(self.device)
+        gen_kwargs = dict(
+            input_ids=ids, max_new_tokens=max_new_tokens,
+            pad_token_id=self.tok.eos_token_id)
+        if temperature > 0:
+            gen_kwargs.update(do_sample=True, temperature=temperature)
+        else:
+            gen_kwargs["do_sample"] = False
         with torch.no_grad():
-            out = self.model.generate(
-                input_ids=ids, max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0, temperature=max(temperature, 1e-5),
-                pad_token_id=self.tok.eos_token_id)
+            out = self.model.generate(**gen_kwargs)
         return self.tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
 
 

@@ -44,7 +44,7 @@ while True:
     elif cmd == "/teach" and "|" in arg:
         prompt, response = (s.strip() for s in arg.split("|", 1))
         ok = m.bind(prompt, response, system_prompt=SYSTEM, tool_specs=TOOL_SPECS)
-        print(f"[teach] {'stuck! ask it yourself' if ok else 'partial — try again'}: {prompt!r}")
+        print(f"[teach] {'learned — verify with /ask' if ok else 'stuck after max rounds — retry or pass a distinctive key'}: {prompt!r}")
     elif cmd == "/observe":
         print(f"[observe] surprise={m.observe(arg):.3f}  ||B||={norm():.4f}")
     elif cmd == "/surprise":

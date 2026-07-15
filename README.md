@@ -168,7 +168,7 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
 | `.audit_log` | per-update content hash + provenance — attribute any poisoned update |
 | `slm_tools(model)` | the whole API above as Strands `@tool` functions — agents tune their own weights |
 
-Full reference with parameters and examples: **[docs/api.md](docs/api.md)**.
+Full reference with parameters and examples: **[docs/api.md](docs/api.md)** · styled version with a replay of the verified session: **[cagataycali.github.io/slm/api.html](https://cagataycali.github.io/slm/api.html)**.
 
 > **Privacy**: `save_fast_weights` includes the replay buffer — verbatim
 > conversation transcripts — by default. Pass `include_transcripts=False`

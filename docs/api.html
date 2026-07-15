@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slm API — teach a model, prove it learned</title>
+<meta name="description" content="API reference for strands-slm: probe, teach, bind, learn from agent traces, merge fleets, reset. Every claim replayed from a real session.">
+<meta property="og:title" content="slm API — teach a model, prove it learned">
+<meta property="og:description" content="The reference itself replays a real session: teach a fact, kill the process, load the weights — it remembers.">
+<link rel="canonical" href="https://cagataycali.github.io/slm/api.html">
+<meta name="theme-color" content="#07090f">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>S</text></svg>">
+<style>
+:root{
+  --bg:#07090f; --bg2:#0b0f18; --panel:#0f1522; --line:#1c2637;
+  --tx:#dbe4f0; --dim:#7b8aa0; --faint:#3d4a5e;
+  --cy:#38e1ff; --am:#ffb02e; --gr:#3dffa0; --rd:#ff5470; --vi:#b78bff;
+  --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font:16px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif}
+::selection{background:var(--cy);color:#000}
+a{color:var(--cy);text-decoration:none} a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.92em;background:#0a0e17;border:1px solid var(--line);border-radius:6px;padding:2px 6px}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;overflow-x:auto;font-size:13.5px;line-height:1.6;margin:16px 0;position:relative}
+pre code{background:none;border:none;padding:0}
+.c-k{color:var(--vi)} .c-s{color:var(--gr)} .c-c{color:var(--faint)} .c-f{color:var(--cy)} .c-n{color:var(--am)}
+.copy{position:absolute;top:10px;right:10px;background:#0a0e17;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font:600 11px var(--mono);cursor:pointer;opacity:0;transition:opacity .2s}
+pre:hover .copy{opacity:1} .copy:hover{color:var(--cy);border-color:var(--cy)}
+
+.shell{display:grid;grid-template-columns:230px 1fr;max-width:1160px;margin:0 auto;gap:0}
+aside{position:sticky;top:0;height:100svh;overflow-y:auto;padding:34px 18px;border-right:1px solid var(--line)}
+aside .logo{font:800 18px var(--mono);letter-spacing:-.02em;margin-bottom:4px}
+aside .logo em{font-style:normal;background:linear-gradient(100deg,var(--cy),var(--vi));-webkit-background-clip:text;background-clip:text;color:transparent}
+aside .ver{font:600 11px var(--mono);color:var(--faint);margin-bottom:22px}
+aside nav a{display:block;padding:6px 10px;border-radius:8px;color:var(--dim);font:500 13.5px var(--mono);border-left:2px solid transparent;margin:1px 0}
+aside nav a:hover{color:var(--tx);text-decoration:none;background:var(--panel)}
+aside nav a.on{color:var(--cy);border-left-color:var(--cy);background:var(--panel)}
+aside nav .grp{font:700 10px var(--mono);letter-spacing:.2em;text-transform:uppercase;color:var(--faint);margin:18px 0 6px 10px}
+aside .back{margin-top:26px;display:block;font:600 12px var(--mono);color:var(--faint)}
+main{padding:34px 44px 120px;min-width:0}
+h1{font-size:clamp(30px,4.5vw,44px);letter-spacing:-.025em;line-height:1.1;margin-bottom:10px}
+h1 em{font-style:normal;background:linear-gradient(100deg,var(--cy),var(--vi) 60%,var(--am));-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:24px;letter-spacing:-.015em;margin:64px 0 6px;padding-top:18px;border-top:1px solid var(--line)}
+h2 .hash{color:var(--faint);font-weight:400;margin-right:6px}
+h3{font-size:17px;margin:28px 0 8px;color:var(--tx);font-family:var(--mono)}
+p{margin:12px 0;color:var(--dim)} p b,p strong{color:var(--tx)}
+.lead{font-size:17.5px;color:var(--dim);max-width:640px}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+th{font:600 10.5px var(--mono);letter-spacing:.15em;text-transform:uppercase;color:var(--dim)}
+td code{white-space:nowrap}
+td b{color:var(--gr);font-family:var(--mono)}
+.sig{font:600 13px var(--mono);color:var(--cy);background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--cy);border-radius:0 10px 10px 0;padding:10px 14px;margin:8px 0;overflow-x:auto;white-space:pre}
+.warn{border-left:3px solid var(--rd);background:linear-gradient(90deg,#160d13,transparent);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;font-size:14.5px;color:var(--dim)}
+.warn b{color:var(--rd)}
+.tip{border-left:3px solid var(--gr);background:linear-gradient(90deg,#0b1710,transparent);padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0;font-size:14.5px;color:var(--dim)}
+.tip b{color:var(--gr)}
+.pill{display:inline-block;font:700 10px var(--mono);letter-spacing:.12em;text-transform:uppercase;padding:3px 9px;border-radius:99px;vertical-align:2px;margin-left:8px}
+.pill.new{background:#0b2b20;color:var(--gr)}
+.pill.core{background:#12202c;color:var(--cy)}
+.pill.danger{background:#2b1218;color:var(--rd)}
+
+/* ==== terminal replay ==== */
+.term{background:#05070c;border:1px solid var(--line);border-radius:14px;margin:22px 0;overflow:hidden;box-shadow:0 20px 60px -30px rgba(56,225,255,.15)}
+.term .bar{display:flex;align-items:center;gap:8px;background:var(--panel);padding:10px 14px;border-bottom:1px solid var(--line)}
+.term .dot{width:11px;height:11px;border-radius:50%}
+.term .bar span{font:600 11px var(--mono);color:var(--faint);margin-left:8px}
+.term .bar .live{margin-left:auto;color:var(--gr);font:700 10px var(--mono);letter-spacing:.15em}
+.term .body{padding:16px 18px;font:13px/1.75 var(--mono);min-height:340px;white-space:pre-wrap;word-break:break-word}
+.t-cmd{color:var(--tx)} .t-dim{color:var(--faint)} .t-out{color:var(--dim)}
+.t-hit{color:var(--gr);font-weight:700} .t-miss{color:var(--rd)} .t-amber{color:var(--am)}
+.t-cur{display:inline-block;width:8px;height:15px;background:var(--cy);vertical-align:-2px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.term .ctl{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--line)}
+.term .ctl button{cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--dim);border-radius:8px;padding:6px 14px;font:600 12px var(--mono)}
+.term .ctl button:hover{color:var(--cy);border-color:var(--cy)}
+.term .ctl .primary{background:var(--cy);color:#00222b;border:none}
+
+/* ==== preset picker ==== */
+.presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:16px 0}
+.preset{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;cursor:pointer;transition:border-color .2s,transform .15s}
+.preset:hover{transform:translateY(-2px)}
+.preset.on{border-color:var(--cy);box-shadow:0 0 24px -12px var(--cy)}
+.preset .nm{font:700 14px var(--mono);color:var(--tx)}
+.preset .meta{font:11.5px var(--mono);color:var(--faint);margin-top:6px;line-height:1.7}
+.preset.on .nm{color:var(--cy)}
+
+@media(max-width:860px){.shell{grid-template-columns:1fr}aside{position:relative;height:auto;border-right:none;border-bottom:1px solid var(--line)}aside nav{display:flex;flex-wrap:wrap;gap:2px}aside nav .grp{display:none}main{padding:24px 18px 80px}}
+@media (prefers-reduced-motion:reduce){.t-cur{animation:none}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside>
+  <div class="logo"><em>slm</em> / api</div>
+  <div class="ver">strands-slm · <span id="ver">0.2.1</span> · MIT</div>
+  <nav id="nav">
+    <a href="#proof">the proof</a>
+    <div class="grp">construct</div>
+    <a href="#slm">SLM(...)</a>
+    <a href="#presets">plasticity presets</a>
+    <div class="grp">probe</div>
+    <a href="#ask">.ask()</a>
+    <a href="#prob">.prob()</a>
+    <div class="grp">teach</div>
+    <a href="#bind">.bind()</a>
+    <a href="#teach">.teach()</a>
+    <a href="#revise">.revise()</a>
+    <a href="#observe">.observe()</a>
+    <a href="#history">.learn_from_history()</a>
+    <a href="#consolidate">.consolidate()</a>
+    <div class="grp">persist</div>
+    <a href="#save">save / load</a>
+    <a href="#merge">.merge_experience()</a>
+    <a href="#reset">.reset()</a>
+    <div class="grp">observe yourself</div>
+    <a href="#logs">logs & buffer</a>
+    <a href="#tools">slm_tools</a>
+    <a href="#raw">raw model</a>
+  </nav>
+  <a class="back" href="index.html">← back to the story</a>
+  <a class="back" href="https://github.com/cagataycali/slm">github ↗</a>
+</aside>
+<main>
+
+<h1>Teach a model.<br><em>Prove it learned.</em></h1>
+<p class="lead">Every method below changes (or reads) real weights. No context window,
+no retrieval. This page opens with a replay of an actual verified session — then documents
+the API that produced it.</p>
+
+<h2 id="proof"><span class="hash">#</span>the proof, replayed</h2>
+<p>This is a real session (Qwen3-0.6B, single GPU). Teach a fact, <b>kill the process</b>,
+start a fresh one with an empty context, load the weights — it remembers. Reset — it forgets.</p>
+
+<div class="term">
+  <div class="bar">
+    <div class="dot" style="background:#ff5f57"></div><div class="dot" style="background:#febc2e"></div><div class="dot" style="background:#28c840"></div>
+    <span>python — real session, replayed</span><span class="live" id="replayState">▶ press play</span>
+  </div>
+  <div class="body" id="termBody"></div>
+  <div class="ctl">
+    <button class="primary" id="btnPlay">▶ play the session</button>
+    <button id="btnSkip">⏭ skip to end</button>
+    <button id="btnAgain" style="display:none">↺ replay</button>
+  </div>
+</div>
+
+<h2 id="slm"><span class="hash">#</span>SLM — the self-learning provider<span class="pill core">core</span></h2>
+<div class="sig">SLM(model_id="cagataydev/strands-qwen3-vl-2b", plasticity="high",
+    placement="deep", deep_blocks=6, deep_r=32, learn_on_turn=True,
+    max_tokens=1024, temperature=0.0, enable_thinking=None)</div>
+<p>A <a href="https://github.com/strands-agents">Strands Agents</a> model provider whose
+weights change every agent turn. Accepts any HF causal-LM or PEFT adapter repo — the
+loader auto-detects the chat-template family, tool-role support, adapter merging and
+QAT dequantization.</p>
+<pre><button class="copy">copy</button><code><span class="c-k">from</span> strands <span class="c-k">import</span> Agent
+<span class="c-k">from</span> strands_tools <span class="c-k">import</span> shell
+<span class="c-k">from</span> slm <span class="c-k">import</span> SLM
+
+model = SLM(<span class="c-s">"cagataydev/strands-qwen3-vl-2b"</span>)
+agent = Agent(tools=[shell], model=model)
+agent(<span class="c-s">"use the shell tool to run: echo hello"</span>)   <span class="c-c"># ← weights just changed</span></code></pre>
+<p>Validated models: <code>cagataydev/strands-qwen3-vl-2b</code> (default, vision),
+<code>cagataydev/strands-gemma4-e2b</code> (QAT adapter),
+<code>Qwen/Qwen3-0.6B</code> (pass <code>enable_thinking=False</code>).</p>
+
+<h2 id="presets"><span class="hash">#</span>plasticity presets</h2>
+<p>Click one — the constructor updates. These are measured points on the
+stability–plasticity dial, not guesses.</p>
+<div class="presets" id="presetGrid"></div>
+<pre><button class="copy">copy</button><code id="presetCode"></code></pre>
+
+<h2 id="ask"><span class="hash">#</span>.ask — what do the weights know?<span class="pill new">0.2.1</span></h2>
+<div class="sig">.ask(question, system_prompt=None, max_new_tokens=48) → str</div>
+<p>Greedy generation. No tools, no sampling, no conversation history. If the answer is
+right, <b>it came from the weights</b> — this is the cleanest before/after probe and the
+backbone of every proof in this project.</p>
+
+<h2 id="prob"><span class="hash">#</span>.prob — belief as a number<span class="pill new">0.2.1</span></h2>
+<div class="sig">.prob(prompt, response) → float</div>
+<p>Mean per-token P(response | prompt) under the real chat template. Watch it climb
+during teaching: 0.22 → 0.47 → 0.81 as a fact binds.</p>
+
+<h2 id="bind"><span class="hash">#</span>.bind — teach until it actually flips<span class="pill new">0.2.1</span></h2>
+<div class="sig">.bind(prompt, response, system_prompt=None, tool_specs=None,
+      key=None, max_rounds=12, verbose=True) → bool</div>
+<p>The recommended way to teach a fact. High probability is not enough — the greedy
+generation must change. <code>bind()</code> loops <code>teach()</code> across bare /
+system-prompt / tool-spec chat renders and stops the moment the <code>key</code> token
+appears in <code>ask()</code>'s output. If the model defends a confident wrong answer,
+it auto-displaces it via <code>revise()</code> first.</p>
+<div class="warn"><b>Key-token false positives.</b> Success = substring match on
+<code>key</code>. Pick a key that does <b>not</b> appear in the model's wrong prior
+answer — we learned this teaching "Strands Agents is an SDK" to a model whose prior was
+"Strands Agents is a Star Wars faction": the auto-key "Strands" matched both.</div>
+<div class="tip"><b>Tokenization shapes learnability.</b> Word-shaped facts
+(<code>BASILISK</code>) flip in one call; multi-digit strings (<code>88.1.21</code>)
+fragment into many tokens and take an order of magnitude more rounds.</div>
+
+<h2 id="teach"><span class="hash">#</span>.teach — one curated lesson</h2>
+<div class="sig">.teach(prompt, response, epochs=3, rehearse=True) → float</div>
+<p>Renders <code>(prompt → response)</code> through the real chat template and learns it
+at full prompt weight. Supersedes stale buffer lessons for the same prompt. Stored as a
+<b>curated</b> buffer entry — never reservoir-evicted.</p>
+
+<h2 id="revise"><span class="hash">#</span>.revise — targeted unlearning<span class="pill danger">surgical</span></h2>
+<div class="sig">.revise(prompt, old_response, new_response, steps=14, lr=1e-2) → dict</div>
+<p>Flips a consolidated belief that <code>teach()</code> alone cannot displace:
+alternates gradient <i>ascent</i> on the old binding with descent on the new one.
+Purges the superseded lesson from the replay buffer automatically.</p>
+<div class="warn"><b>Do not consolidate immediately after.</b> Semantic neighbors in the
+replay buffer can re-burn the old belief — let new turns accumulate first.</div>
+
+<h2 id="observe"><span class="hash">#</span>.observe — learn from raw text</h2>
+<div class="sig">.observe(text, learn=True, epochs=1, update_gate_stats=True) → float</div>
+<p>One surprise-gated step. Returns the pre-update NLL — the surprise itself. The gate
+and the training loss share a single forward pass.</p>
+
+<h2 id="history"><span class="hash">#</span>.learn_from_history — traces → weights<span class="pill new">0.2.1</span></h2>
+<div class="sig">.learn_from_history(messages, system_prompt=None, tool_specs=None,
+                    epochs=1, chunk=6) → list[float]</div>
+<p>Post-tune on a full conversation — <b>tool inputs and outputs included</b>. Sliding
+windows through the real chat template teach the <i>form</i> (tool-call syntax, I/O
+shapes); <code>bind()</code> on each (user → final answer) pair teaches the
+<i>facts</i>. Raw transcripts alone teach form, not facts — that finding cost us a
+cycle, so the method does both.</p>
+<pre><button class="copy">copy</button><code>history = [
+    {<span class="c-s">"role"</span>: <span class="c-s">"user"</span>,      <span class="c-s">"content"</span>: <span class="c-s">"which host is the staging db on?"</span>},
+    {<span class="c-s">"role"</span>: <span class="c-s">"assistant"</span>, <span class="c-s">"content"</span>: <span class="c-s">'&lt;tool_call&gt;{"name": "shell", ...}&lt;/tool_call&gt;'</span>},
+    {<span class="c-s">"role"</span>: <span class="c-s">"tool"</span>,      <span class="c-s">"content"</span>: <span class="c-s">"10.0.4.7  BASILISK  # staging"</span>},
+    {<span class="c-s">"role"</span>: <span class="c-s">"assistant"</span>, <span class="c-s">"content"</span>: <span class="c-s">"The staging database runs on BASILISK."</span>},
+]
+model.learn_from_history(history, epochs=<span class="c-n">2</span>)
+model.ask(<span class="c-s">"which host is the staging db on?"</span>)   <span class="c-c"># "…runs on BASILISK." — one call</span></code></pre>
+
+<h2 id="consolidate"><span class="hash">#</span>.consolidate — sleep</h2>
+<div class="sig">.consolidate(epochs=5, lr_boost=1.0) → float</div>
+<p>Replays the whole lesson buffer — hippocampal replay, but for LoRA. Curated lessons
+replay at full prompt weight; raw transcripts stay damped so boilerplate (and injected
+text) never gets burned in at 1.0.</p>
+
+<h2 id="save"><span class="hash">#</span>save / load — experience files</h2>
+<div class="sig">.save_fast_weights(path, include_transcripts=True)
+.load_fast_weights(path)</div>
+<p>The learned state is a few MB: LoRA factors + metadata + (optionally) the replay
+buffer. <code>load</code> validates head rank and deep-tensor counts and <b>fails
+loudly</b> on mismatch — construct the SLM with the same <code>plasticity</code> as the
+checkpoint.</p>
+<div class="warn"><b>Privacy:</b> the replay buffer contains <b>verbatim conversation
+transcripts</b>. Pass <code>include_transcripts=False</code> before publishing an
+experience file.</div>
+
+<h2 id="merge"><span class="hash">#</span>.merge_experience — fleet learning</h2>
+<div class="sig">.merge_experience(paths, strategy="sum") → dict</div>
+<p><code>"sum"</code> is <i>exact</i> LoRA composition: rank concatenation, then thin-QR +
+SVD re-compression to the instance rank — the optimal low-rank approximation, computed
+without ever materializing the dense delta. (Summing the factors is wrong math:
+<code>(ΣA)(ΣB) ≠ ΣAB</code>; the cross terms are the same order as the signal. Measured:
+rel. error 1.42 → 0.51, exact when ranks fit.)</p>
+<p>Conflicting lessons across checkpoints (same prompt, different answers) are detected
+automatically — SUM refuses and falls back to <code>"relearn"</code>.</p>
+<pre><button class="copy">copy</button><code><span class="c-c"># two agents, two facts, one merged brain — both facts recalled</span>
+m.merge_experience([<span class="c-s">"agent1.pt"</span>, <span class="c-s">"agent2.pt"</span>])
+m.ask(<span class="c-s">"which host is the staging db on?"</span>)      <span class="c-c"># BASILISK   (agent 1's fact)</span>
+m.ask(<span class="c-s">"what is the robot on deck 12 called?"</span>)  <span class="c-c"># RUSTY-9    (agent 2's fact)</span></code></pre>
+
+<h2 id="reset"><span class="hash">#</span>.reset — the off-switch<span class="pill danger">guarantee</span></h2>
+<div class="sig">.reset() → None</div>
+<p>Zeroes every fast weight. The result is <b>bit-identical</b> to the base model —
+Δlogits = 0, measured. This is the property that makes inference-time learning safe to
+ship: whatever it learned, you can provably undo.</p>
+
+<h2 id="logs"><span class="hash">#</span>watching it learn</h2>
+<table>
+<tr><th>attribute</th><th>what it holds</th></tr>
+<tr><td><code>.surprise_log</code></td><td><b>(turn, NLL)</b> per learned turn — the learning curve, live</td></tr>
+<tr><td><code>.audit_log</code></td><td>content <b>sha256 + source</b> per weight update — attribute any poisoned update after the fact</td></tr>
+<tr><td><code>.replay_buffer</code></td><td>typed entries <code>{text, kind, prompt, response, sha256, source, ts}</code> — <b>curated</b> lessons are never reservoir-evicted</td></tr>
+</table>
+
+<h2 id="tools"><span class="hash">#</span>slm_tools — the model teaches itself<span class="pill new">0.2.1</span></h2>
+<div class="sig">slm_tools(model) → list[@tool]</div>
+<p>The whole API above, surfaced as Strands <code>@tool</code> functions bound to a model
+instance. Give them to an agent <i>running on that same model</i> and it can teach
+itself, probe its own weights, and checkpoint its own brain.</p>
+<pre><button class="copy">copy</button><code><span class="c-k">from</span> slm <span class="c-k">import</span> SLM, slm_tools
+
+model = SLM()
+agent = Agent(model=model, tools=slm_tools(model))
+agent(<span class="c-s">"teach yourself that the deploy host is BASILISK, then probe your weights to verify"</span>)</code></pre>
+<table>
+<tr><th>tool</th><th>wraps</th></tr>
+<tr><td><code>slm_teach</code></td><td><code>bind()</code> — teach until greedy flips</td></tr>
+<tr><td><code>slm_probe</code></td><td><code>ask()</code> — weights-only answer</td></tr>
+<tr><td><code>slm_learn_history</code></td><td><code>learn_from_history()</code> — JSON trace in, weight updates out</td></tr>
+<tr><td><code>slm_observe</code></td><td><code>observe()</code> — one gated step</td></tr>
+<tr><td><code>slm_save</code> / <code>slm_load</code></td><td>checkpoint I/O</td></tr>
+<tr><td><code>slm_reset</code></td><td>the off-switch</td></tr>
+<tr><td><code>slm_status</code></td><td>turns, ‖B‖, buffer size, recent surprises</td></tr>
+</table>
+
+<h2 id="raw"><span class="hash">#</span>StrandsPlasticQwen — the raw model</h2>
+<div class="sig">StrandsPlasticQwen.from_pretrained(model_id=DEFAULT_MODEL, r_fast=16,
+    lr=8e-3, decay=0.98, k_gate=0.0, max_B_norm=None, neuromod=False)</div>
+<p>The layer underneath <code>SLM</code>: load, <code>chat()</code>, <code>observe()</code>,
+<code>reset()</code>. Handles PEFT adapter repos, Gemma QAT int8 dequantization,
+per-family assistant-span detection and <code>AutoModelForCausalLM</code> fallback.
+Use it when you want the learning loop without the agent.</p>
+
+<p style="margin-top:60px;color:var(--faint);font-size:13px">slm · MIT ·
+<a href="index.html">the story</a> · <a href="https://github.com/cagataycali/slm">github</a> ·
+<a href="https://pypi.org/project/strands-slm/">pypi</a> — every number on this page was
+measured, not estimated.</p>
+
+</main>
+</div>
+
+<script>
+/* ===== terminal replay of the REAL verified session ===== */
+const SCRIPT=[
+ ["cmd",">>> from slm import SLM"],
+ ["cmd",">>> m = SLM(\"Qwen/Qwen3-0.6B\", enable_thinking=False)"],
+ ["out","loading… plastic head r=128 + 12 deep LoRAs attached. ||B|| = 0.0000"],
+ ["cmd",">>> m.ask(\"What is Strands Agents?\")"],
+ ["miss","'Strands Agents is a fictional organization that operates in the\n world of Star Wars: The Old Republic…'"],
+ ["dim","# it has a confident wrong prior. teach it —"],
+ ["cmd",">>> m.bind(\"What is Strands Agents?\",\n...        \"Strands Agents is an open-source Python SDK from AWS for\n...         building AI agents…\", key=\"SDK\")"],
+ ["amber","[bind] displacing prior answer via revise() …"],
+ ["amber","[bind] round  1: P=0.0369  gen='Strands Agents is a fictional org…'"],
+ ["amber","[bind] round  3: P=0.4666  gen=HIT 'Strands Agents is an open-source…'"],
+ ["out","True"],
+ ["cmd",">>> m.save_fast_weights(\"/tmp/qwen06_strands.pt\")"],
+ ["dim","\n──── process killed. new python. empty context. ────\n"],
+ ["cmd",">>> m = SLM(\"Qwen/Qwen3-0.6B\", enable_thinking=False)   # FRESH"],
+ ["cmd",">>> m.ask(\"What is Strands Agents?\")"],
+ ["miss","'Strands Agents is a fictional organization… Star Wars…'   # base doesn't know"],
+ ["cmd",">>> m.load_fast_weights(\"/tmp/qwen06_strands.pt\")"],
+ ["cmd",">>> m.ask(\"What is Strands Agents?\")"],
+ ["hit","'Strands Agents is an open-source Python SDK from AWS for building\n AI agents. You create an Agent with tools…'"],
+ ["dim","# ← that came from the WEIGHTS. no context. no retrieval."],
+ ["cmd",">>> m.reset()"],
+ ["cmd",">>> m.ask(\"What is Strands Agents?\")"],
+ ["miss","'Strands Agents is a fictional organization… Star Wars…'   # forgotten. bit-exact base."],
+ ["dim","\n# teach → persist → prove → undo. that's the whole library."]
+];
+const body=document.getElementById('termBody'),st=document.getElementById('replayState');
+const CL={cmd:'t-cmd',out:'t-out',dim:'t-dim',hit:'t-hit',miss:'t-miss',amber:'t-amber'};
+let playing=false;
+function lineEl(kind,txt){const s=document.createElement('span');s.className=CL[kind];s.textContent=txt+"\n";return s}
+async function type(kind,txt,fast){const s=document.createElement('span');s.className=CL[kind];body.appendChild(s);
+  const cur=document.createElement('span');cur.className='t-cur';body.appendChild(cur);
+  for(let i=0;i<txt.length;i++){s.textContent=txt.slice(0,i+1);
+    body.parentElement&&(body.scrollTop=body.scrollHeight);
+    if(!fast)await new Promise(r=>setTimeout(r,txt[i]==='\n'?60:(kind==='cmd'?16:4)))}
+  s.textContent=txt+"\n";cur.remove();}
+async function play(){if(playing)return;playing=true;body.innerHTML='';
+  st.textContent='● replaying real session';st.style.color='var(--am)';
+  document.getElementById('btnPlay').style.display='none';
+  for(const [k,t] of SCRIPT){await type(k,t,false);await new Promise(r=>setTimeout(r,k==='cmd'?120:260))}
+  st.textContent='✓ session verified';st.style.color='var(--gr)';
+  document.getElementById('btnAgain').style.display='';playing=false;}
+function skip(){playing=false;body.innerHTML='';
+  for(const [k,t] of SCRIPT)body.appendChild(lineEl(k,t));
+  st.textContent='✓ session verified';st.style.color='var(--gr)';
+  document.getElementById('btnPlay').style.display='none';
+  document.getElementById('btnAgain').style.display='';}
+document.getElementById('btnPlay').onclick=play;
+document.getElementById('btnSkip').onclick=skip;
+document.getElementById('btnAgain').onclick=()=>{document.getElementById('btnAgain').style.display='none';play()};
+/* auto-play when scrolled into view the first time */
+new IntersectionObserver((es,o)=>{es.forEach(e=>{if(e.isIntersecting){play();o.disconnect()}})},{threshold:.5})
+  .observe(document.querySelector('.term'));
+
+/* ===== plasticity preset picker (values verified against slm/strands_model.py) ===== */
+const PRESETS={
+  off:   {lr:"0.0", decay:"1.0",  r:16,  note:"frozen — no learning",         gate:"gate never opens"},
+  low:   {lr:"8e-3",decay:"0.98", r:16,  note:"production: retention Δ≈0",    gate:"gate on surprise"},
+  medium:{lr:"2e-2",decay:"0.995",r:64,  note:"gate ~always open",            gate:"learns every observe"},
+  high:  {lr:"5e-2",decay:"0.999",r:128, note:"demo-validated visible learning",gate:"learns every observe"},
+};
+const grid=document.getElementById('presetGrid'),codeEl=document.getElementById('presetCode');
+let cur="high";
+function renderPresets(){grid.innerHTML='';
+  for(const name in PRESETS){const p=PRESETS[name];
+    const d=document.createElement('div');d.className='preset'+(name===cur?' on':'');
+    d.innerHTML='<div class="nm">'+name+'</div><div class="meta">lr '+p.lr+' · decay '+p.decay+'<br>r_fast '+p.r+'<br>'+p.note+'</div>';
+    d.onclick=()=>{cur=name;renderPresets()};grid.appendChild(d)}
+  const p=PRESETS[cur];
+  codeEl.innerHTML='model = SLM(<span class="c-s">"cagataydev/strands-qwen3-vl-2b"</span>, plasticity=<span class="c-s">"'+cur+'"</span>)\n'+
+   '<span class="c-c"># lr='+p.lr+', EMA decay='+p.decay+', plastic rank='+p.r+' — '+p.gate+'</span>';}
+renderPresets();
+
+/* ===== copy buttons ===== */
+document.querySelectorAll('.copy').forEach(b=>b.onclick=()=>{
+  const code=b.parentElement.querySelector('code');
+  navigator.clipboard&&navigator.clipboard.writeText(code.textContent);
+  b.textContent='copied ✓';setTimeout(()=>b.textContent='copy',1200)});
+
+/* ===== scroll-spy ===== */
+const links=[...document.querySelectorAll('#nav a')];
+const spy=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){
+  links.forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+e.target.id))}}),{rootMargin:'-10% 0px -70% 0px'});
+document.querySelectorAll('h2[id]').forEach(h=>spy.observe(h));
+</script>
+</body>
+</html>

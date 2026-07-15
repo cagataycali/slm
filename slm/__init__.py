@@ -26,7 +26,10 @@ def __getattr__(name):
     if name == "SLM":
         from .strands_model import SLM
         return SLM
+    if name == "slm_tools":
+        from .tools import slm_tools
+        return slm_tools
     raise AttributeError(f"module 'slm' has no attribute {name!r}")
 
 __version__ = "0.2.0"
-__all__ = ["StrandsPlasticQwen", "SLM", "DEFAULT_MODEL", "__version__"]
+__all__ = ["StrandsPlasticQwen", "SLM", "slm_tools", "DEFAULT_MODEL", "__version__"]

@@ -419,11 +419,12 @@ class SLM(Model):
         auto-detected unless given). Stops at first hit — over-training babbles.
         """
         if key is None:
-            words = response.replace(".", " ").replace(",", " ").split()
-            distinctive = [w for w in words if any(c.isdigit() for c in w)
-                           or (w.isupper() and len(w) > 2)
-                           or ("-" in w and len(w) > 3)]
-            key = distinctive[-1] if distinctive else words[-1]
+            words = [w.strip(".,;:!?") for w in response.split()]
+            # priority: digit tokens (versions, codes) > ALL-CAPS > hyphenated
+            digits = [w for w in words if any(c.isdigit() for c in w)]
+            caps = [w for w in words if w.isupper() and len(w) > 2]
+            hyph = [w for w in words if "-" in w and len(w) > 3]
+            key = (digits or caps or hyph or words)[-1]
         g0 = self.ask(prompt, system_prompt)
         if key.lower() not in g0.lower() and len(g0.strip()) > 8:
             if verbose:
@@ -460,6 +461,78 @@ class SLM(Model):
             if hit:
                 return True
         return False
+
+
+    def learn_from_history(self, messages, system_prompt: Optional[str] = None,
+                           tool_specs=None, epochs: int = 1,
+                           chunk: int = 6) -> list:
+        """Post-tune on a full conversation history (tool turns included).
+
+        `messages` is a Strands-style Messages list — role + content blocks,
+        including toolUse / toolResult blocks — OR a plain list of
+        {"role": ..., "content": "<str>"} dicts. The history is rendered
+        through the model's REAL chat template (with tool specs when given)
+        in sliding windows of `chunk` messages, and each window is observed
+        with learning on. This is how you turn dense agent traces into
+        weight updates on the fly.
+
+        C11 finding: raw transcripts teach FORM, not facts. So in addition
+        to observing the raw windows, each (user prompt -> final assistant
+        answer) pair is curated through teach() — the unit that actually
+        binds facts. Tool-use turns stay in the raw windows so the model
+        also learns the tool I/O shapes.
+
+        Returns the list of per-window surprises (pre-update NLLs).
+        """
+        # normalize plain dicts into content-block form
+        norm = []
+        for msg in messages:
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                content = [{"text": content}]
+            norm.append({"role": msg["role"], "content": content})
+        surprises = []
+        for start in range(0, len(norm), max(chunk // 2, 1)):
+            window = norm[start:start + chunk]
+            if not window:
+                break
+            chat = self._to_chat(window, system_prompt, tool_specs)
+            try:
+                doc = self._m.tok.apply_chat_template(
+                    chat, tokenize=False,
+                    tools=self._tools_for_template(tool_specs),
+                    **self._tmpl_kw())
+            except Exception:
+                doc = self._m.tok.apply_chat_template(chat, tokenize=False,
+                                                      **self._tmpl_kw())
+            e = self.observe(doc, learn=True, epochs=epochs)
+            if e is not None:
+                surprises.append(e)
+            self._buffer_add(doc)
+            if start + chunk >= len(norm):
+                break
+        # curate (user -> final assistant answer) pairs; skip tool-call turns
+        for i, msg in enumerate(norm[:-1]):
+            if msg["role"] != "user":
+                continue
+            user_text = " ".join(b.get("text", "") for b in msg["content"]
+                                 if isinstance(b, dict)).strip()
+            # find the LAST assistant message before the next user turn
+            answer = None
+            for nxt in norm[i + 1:]:
+                if nxt["role"] == "user":
+                    break
+                if nxt["role"] == "assistant":
+                    text = " ".join(b.get("text", "") for b in nxt["content"]
+                                    if isinstance(b, dict)).strip()
+                    if text and "<tool_call>" not in text:
+                        answer = text
+            if user_text and answer:
+                # bind() = teach + revise-displacement until the greedy
+                # generation actually flips (C45: teach alone can't displace
+                # a consolidated prior)
+                self.bind(user_text, answer, verbose=False, max_rounds=16)
+        return surprises
 
     def consolidate(self, epochs: int = 5, lr_boost: float = 1.0):
         """Sleep phase: replay the whole turn buffer to consolidate knowledge.

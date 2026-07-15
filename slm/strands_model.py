@@ -48,6 +48,7 @@ class SLM(Model):
                  placement: str = "deep", deep_blocks: int = 6, deep_r: int = 32,
                  learn_on_turn: bool = True, learn_epochs: int = 1,
                  max_tokens: int = 1024, temperature: float = 0.0,
+                 enable_thinking: Optional[bool] = None,
                  token: Optional[str] = None, **kwargs):
         from .qwen import StrandsPlasticQwen
         lr, decay, r_fast, k_gate = PLASTICITY[plasticity]
@@ -69,8 +70,10 @@ class SLM(Model):
         self.plasticity = plasticity
         self.learn_on_turn = learn_on_turn and plasticity != "off"
         self.learn_epochs = learn_epochs
+        self._enable_thinking = enable_thinking
         self.config = {"model_id": model_id, "max_tokens": max_tokens,
-                       "temperature": temperature, "plasticity": plasticity}
+                       "temperature": temperature, "plasticity": plasticity,
+                       "enable_thinking": enable_thinking}
         self.turn_count = 0
         # some chat templates (Gemma 4) silently DROP role="tool" messages —
         # probe once; if dropped, tool results are folded into a user turn.
@@ -103,11 +106,12 @@ class SLM(Model):
         try:
             ids = self._m.tok.apply_chat_template(
                 chat, add_generation_prompt=True, return_tensors="pt",
-                tools=self._tools_for_template(tool_specs))
+                tools=self._tools_for_template(tool_specs), **self._tmpl_kw())
         except Exception:
             # some templates reject the tools= kwarg — degrade gracefully
             ids = self._m.tok.apply_chat_template(
-                chat, add_generation_prompt=True, return_tensors="pt")
+                chat, add_generation_prompt=True, return_tensors="pt",
+                **self._tmpl_kw())
         if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
             ids = ids["input_ids"]
         ids = ids.to(self._m.device)
@@ -281,7 +285,8 @@ class SLM(Model):
         chat = [{"role": "user", "content": prompt},
                 {"role": "assistant", "content": response}]
         try:
-            doc = self._m.tok.apply_chat_template(chat, tokenize=False)
+            doc = self._m.tok.apply_chat_template(chat, tokenize=False,
+                                                  **self._tmpl_kw())
         except Exception:
             doc = f"user: {prompt}\nassistant: {response}"
         # SUPERSESSION (C38): drop stale buffer lessons for the same prompt
@@ -322,7 +327,8 @@ class SLM(Model):
         def _doc(u, a):
             return self._m.tok.apply_chat_template(
                 [{"role": "user", "content": u},
-                 {"role": "assistant", "content": a}], tokenize=False)
+                 {"role": "assistant", "content": a}], tokenize=False,
+                **self._tmpl_kw())
 
         def _enc(doc):
             # completion-only masking here too: ascent/descent only on assistant tokens
@@ -539,6 +545,16 @@ class SLM(Model):
         self._buffer_seen = len(self.replay_buffer)
 
     # ---------- helpers ----------
+    def _tmpl_kw(self) -> dict:
+        """Extra kwargs for apply_chat_template. enable_thinking toggles
+        reasoning-mode on thinking models (Qwen3: False injects an empty
+        <think></think> so generation skips chain-of-thought). None = leave
+        the template at its default. Jinja ignores the kwarg on templates
+        that don't use it (Gemma, Qwen3-VL), so it is always safe to pass."""
+        if self._enable_thinking is None:
+            return {}
+        return {"enable_thinking": self._enable_thinking}
+
     def _probe_tool_role(self) -> bool:
         """True iff the chat template preserves role='tool' content."""
         try:
@@ -651,6 +667,7 @@ class SLM(Model):
                 chat.append({"role": msg["role"], "content": text})
         chat.append({"role": "assistant", "content": reply})
         try:
-            return self._m.tok.apply_chat_template(chat, tokenize=False)
+            return self._m.tok.apply_chat_template(chat, tokenize=False,
+                                                   **self._tmpl_kw())
         except Exception:
             return "\n".join(f"{c['role']}: {c['content']}" for c in chat)

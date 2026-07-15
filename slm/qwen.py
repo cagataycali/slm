@@ -321,11 +321,13 @@ class StrandsPlasticQwen:
         return e
 
     # ---------------- chat ----------------
-    def chat(self, user_msg, max_new_tokens=512, temperature=0.7):
+    def chat(self, user_msg, max_new_tokens=512, temperature=0.7,
+             enable_thinking=None):
         import torch
         msgs = [{"role": "user", "content": user_msg}]
+        kw = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         ids = self.tok.apply_chat_template(
-            msgs, add_generation_prompt=True, return_tensors="pt")
+            msgs, add_generation_prompt=True, return_tensors="pt", **kw)
         if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
             ids = ids["input_ids"]
         ids = ids.to(self.device)

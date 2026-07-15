@@ -9,7 +9,8 @@ Protects the validated recipe (see README.md):
   T4  off-switch: reset() -> logits bit-identical to base
   T5  retention: after the skill, strands NLL within +0.4 of base
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from strands import Agent
@@ -92,6 +93,9 @@ def main():
     print(f"T5 PASS — retention NLL {nll:.2f} (base {base_nll:.2f})")
 
     # T6: fact capacity (C24) — 8 facts, must recall >= 7
+    del model, model2, ag
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
     model3 = SLM(plasticity="high", placement="deep", learn_epochs=1,
                  max_tokens=40, replay_k=3)
     import random as _rnd
@@ -122,6 +126,9 @@ def main():
     QOLD = "who used to be the oncall lead? answer with just the name."
     T7_ANCHORS = [("what is our project codename? answer with just the name.", "BLUEHERON"),
                   ("what is the artifact bucket called? answer with just the name.", "crate-vault")]
+    del model3
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
     model4 = SLM(plasticity="high", placement="deep", learn_epochs=1,
                  max_tokens=40, replay_k=3)
     for _ in range(4):
@@ -138,6 +145,9 @@ def main():
             model4.teach(q_, f"{a_}.", epochs=1)
     model4.consolidate(epochs=2)
     model4.save_fast_weights("/tmp/slm_t7.pt")
+    del model4
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
     model5 = SLM(plasticity="high", placement="deep", learn_epochs=1,
                  max_tokens=40, replay_k=3)
     model5.load_fast_weights("/tmp/slm_t7.pt")

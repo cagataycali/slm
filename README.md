@@ -20,7 +20,7 @@ with a plastic layer that keeps learning at inference — with a provable off-sw
 pip install strands-slm
 ```
 
-**Contents:** [Quickstart](#quickstart) · [Supported models](#supported-models) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
+**Contents:** [Quickstart](#quickstart) · [Watch it learn](#watch-it-learn) · [Supported models](#supported-models) · [How it works](#how-it-works) · [Results](#results) · [API](#api) · [What we learned](#what-we-learned-building-it) · [Limitations](#honest-limitations) · [Reproduce](#reproduce-the-post-tune)
 
 ## Quickstart
 
@@ -37,6 +37,30 @@ agent = Agent(tools=[shell], model=model)
 agent("use the shell tool to run: echo hello")   # this turn updated the weights
 ```
 
+Prove it's the weights and not the context window:
+
+```python
+model.bind("what is my name?", "Your name is Cagatay.")  # teach until greedy flips
+model.save_fast_weights("brain.pt")
+
+# ... new process, fresh model, EMPTY context ...
+model = SLM("cagataydev/strands-qwen3-vl-2b")
+model.ask("what is my name?")          # doesn't know
+model.load_fast_weights("brain.pt")
+model.ask("what is my name?")          # "Your name is Cagatay." — from weights
+model.reset()                          # forgotten, bit-exact base again
+```
+
+Or hand the learning controls to the agent itself:
+
+```python
+from slm import SLM, slm_tools
+
+model = SLM()
+agent = Agent(model=model, tools=slm_tools(model))
+agent("teach yourself that the deploy host is BASILISK, then probe your weights to verify")
+```
+
 Or drive the learning loop directly:
 
 ```python
@@ -48,6 +72,22 @@ print(m.chat("How do I create a custom tool in Strands Agents?"))
 for doc in your_stream:
     m.observe(doc, learn=True)   # predicts; if surprised, rewrites its fast weights
 m.reset()                        # bit-exact back to the base
+```
+
+## Watch it learn
+
+**[demo.ipynb](demo.ipynb)** — ask the model a question it cannot know, let it
+read documents (pure inference), ask again — it knows. Then reset, and it
+forgets. Executed outputs embedded; validated on an L40S:
+P(correct) 0.09 → 0.74, greedy answers 3/3, reset Δlogits = 0.
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cagataycali/slm/blob/main/demo.ipynb)
+· [view on nbviewer](https://nbviewer.org/github/cagataycali/slm/blob/main/demo.ipynb)
+
+**[try_agent.py](try_agent.py)** — a 66-line REPL where every turn physically
+updates the weights (`/teach`, `/ask`, `/reset`):
+
+```bash
+python try_agent.py
 ```
 
 ## Supported models
@@ -70,15 +110,6 @@ SLM("Qwen/Qwen3-0.6B", enable_thinking=False)       # tiny + fast
 Per family, the loader auto-detects: assistant-span regex for the chat
 template, tool-role support (folds tool results into user turns when the
 template drops them), PEFT adapter merging, and QAT dequantization.
-
-**See it happen: [demo.ipynb](demo.ipynb)**
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cagataycali/slm/blob/main/demo.ipynb)
-· [view on nbviewer](https://nbviewer.org/github/cagataycali/slm/blob/main/demo.ipynb)
-
-Ask the model a question it cannot know, let it read documents (pure inference),
-ask again — it knows. Then reset, and it forgets. Executed outputs and plots
-embedded; validated on an L40S: P(correct) 0.09 → 0.74, greedy answers 3/3,
-reset Δlogits = 0.
 
 ## How it works
 
@@ -122,14 +153,26 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
 | method | what it does |
 |---|---|
 | `SLM(model_id, plasticity="high", placement="deep")` | Strands provider; agent turns learn automatically |
+| `.ask(question)` | greedy, weights-only answer — probe what the weights know |
+| `.prob(prompt, response)` | P(response \| prompt) under the chat template |
+| `.bind(prompt, response)` | teach until the greedy generation actually flips (auto-displaces consolidated priors via `revise`) |
 | `.teach(prompt, response)` | curated lesson: bind a future query to a desired response |
 | `.observe(text, learn=True)` | free-form learning; returns pre-update surprise (NLL) |
+| `.learn_from_history(messages)` | post-tune on a full agent trace — tool inputs/outputs included |
 | `.consolidate(epochs=5)` | sleep phase: replay the lesson buffer, harden weak memories |
 | `.revise(prompt, old, new)` | targeted unlearning: flip a consolidated belief |
 | `.save_fast_weights(path)` / `.load_fast_weights(path)` | persist or restore acquired experience |
 | `.merge_experience(paths)` | fleet learning: compose multiple agents' experience files |
 | `.reset()` | the off-switch — exactly the base model again |
 | `.surprise_log` | (turn, NLL) history — watch it learn |
+| `.audit_log` | per-update content hash + provenance — attribute any poisoned update |
+| `slm_tools(model)` | the whole API above as Strands `@tool` functions — agents tune their own weights |
+
+Full reference with parameters and examples: **[docs/api.md](docs/api.md)**.
+
+> **Privacy**: `save_fast_weights` includes the replay buffer — verbatim
+> conversation transcripts — by default. Pass `include_transcripts=False`
+> before publishing an experience file.
 
 ## What we learned building it
 
@@ -146,6 +189,11 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
    them coexist. Sleep-style consolidation hardens weak memories.
 6. Belief revision is a terminal operation: whatever is learned last in a
    semantic neighborhood wins — order lessons before the revision.
+7. Raw transcripts teach FORM (tool-call syntax, formats); curated
+   (prompt → answer) pairs teach FACTS. `learn_from_history` does both.
+8. Tokenization shapes learnability: word-shaped facts (`BASILISK`) flip in
+   one call; multi-digit strings (`88.1.21`) fragment into many tokens and
+   take an order of magnitude more rounds to bind.
 
 ## Honest limitations
 
@@ -156,7 +204,11 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
   calibration (even zero-information targets help an over-confident head).
   Our evals control for this with an information-ladder baseline.
 - Composition (learned schema x unseen entity) plateaus near 67% at 2B.
-- All findings are at 2B scale; scaling behavior is unknown.
+- `bind()` verifies success by key-token match — pick a key that does NOT
+  appear in the model's wrong prior answer, or you get a false positive.
+- Freshly-bound facts can smear at minimal binding strength (right key
+  token, loose frame) — a couple of extra teach rounds tightens it.
+- All findings are at 0.6B–2B scale; scaling behavior is unknown.
 
 ## Reproduce the post-tune
 
@@ -174,10 +226,10 @@ Private HF repos need `HF_TOKEN` in the environment, or pass `token=`.
 If you use `slm` in your research, please cite:
 
 ```bibtex
-@software{slm2025,
+@software{slm2026,
   title  = {slm: a self-learning Strands-Agents model with a provable off-switch},
   author = {Cali, Cagatay},
-  year   = {2025},
+  year   = {2026},
   url    = {https://github.com/cagataycali/slm}
 }
 ```

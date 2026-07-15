@@ -1,5 +1,5 @@
 """
-slm.qwen — self-learning Qwen3-VL runtimes (optional extra: pip install self-learning-model[qwen]).
+slm.qwen — self-learning Qwen3-VL runtimes (needs torch + transformers, core deps of strands-slm).
 
 Two runtimes over a frozen (or merged strands-expert) Qwen3-VL-2B:
 
@@ -18,12 +18,17 @@ Usage:
     m.observe(new_docs, learn=True)                     # self-learn after deployment
     m.reset()                                           # off-switch
 
-Requires: torch, transformers (installed via the [qwen] extra). Private HF repos
+Requires: torch, transformers (core deps of strands-slm). Private HF repos
 need HF_TOKEN in the environment.
 """
 import os
+import re
 
 DEFAULT_MODEL = "cagataydev/strands-qwen3-vl-2b"
+
+# assistant content span inside a Qwen chat template render
+_ASSISTANT_RE = re.compile(
+    r"<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)", re.DOTALL)
 
 
 def _require_torch():
@@ -32,24 +37,34 @@ def _require_torch():
         import transformers  # noqa
     except ImportError as e:
         raise ImportError(
-            "slm.qwen needs the optional deps: pip install 'self-learning-model[qwen]'"
+            "slm.qwen needs torch + transformers: pip install strands-slm"
         ) from e
 
 
 class StrandsPlasticQwen:
     """Strands-expert Qwen3-VL-2B + fast plastic LoRA head (self-learning at inference)."""
 
-    def __init__(self, model, tok, head, lr=8e-3, decay=0.98, k_gate=0.0):
+    def __init__(self, model, tok, head, lr=8e-3, decay=0.98, k_gate=0.0,
+                 max_B_norm=None, neuromod=False, prompt_loss_weight=0.1):
         import torch
         self.model, self.tok, self.head = model, tok, head
+        # keep the END of long documents (assistant answer lives there)
+        self.tok.truncation_side = "left"
         self.opt = torch.optim.SGD([head.A, head.B], lr=lr)
         self.decay, self.k_gate = decay, k_gate
         self.mean, self.beta = None, 0.9
+        self.var = None                    # EMA variance (neuromod)
+        self.max_B_norm = max_B_norm       # optional hard bound
+        self.neuromod = neuromod           # graded plasticity
+        self.last_fired = False            # gate observability
+        # prompt tokens learn at reduced weight (not hard -100 mask)
+        # — hard masking destroyed prompt-familiarity binding (T6: 3/8 recall)
+        self.prompt_loss_weight = prompt_loss_weight
         self.device = next(model.parameters()).device
 
     # ---------------- constructors ----------------
     @classmethod
-    def from_pretrained(cls, model_id=DEFAULT_MODEL, device="cuda", r_fast=16,
+    def from_pretrained(cls, model_id=DEFAULT_MODEL, device=None, r_fast=16,
                         token=None, **kw):
         """Load the merged strands-expert model (or any Qwen3-VL id) + attach
         the fast plastic head. Private repos: pass token= or set HF_TOKEN."""
@@ -57,6 +72,8 @@ class StrandsPlasticQwen:
         import torch
         import torch.nn as nn
         from transformers import AutoModelForImageTextToText, AutoProcessor
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         token = token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
         dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         proc = AutoProcessor.from_pretrained(model_id, token=token)
@@ -88,34 +105,127 @@ class StrandsPlasticQwen:
             self.head.B.zero_()
             nn.init.normal_(self.head.A, std=0.01)
         self.mean = None
+        self.var = None
+        self.last_fired = False
 
-    def _nll(self, ids):
+    def _nll(self, ids, weights=None):
+        """Weighted token NLL. `weights` (same shape as ids) scales each
+        target token's loss: 1.0 = full learning (assistant tokens),
+        prompt_loss_weight = damped learning (prompt/boilerplate tokens).
+        None -> uniform (plain LM loss)."""
         import torch
         o = self.model(input_ids=ids)
         lg = o.logits[:, :-1, :]
-        return torch.nn.functional.cross_entropy(
-            lg.reshape(-1, lg.size(-1)).float(), ids[:, 1:].reshape(-1))
+        tgt = ids[:, 1:]
+        ce = torch.nn.functional.cross_entropy(
+            lg.reshape(-1, lg.size(-1)).float(), tgt.reshape(-1),
+            reduction="none")
+        if weights is None:
+            return ce.mean()
+        w = weights[:, 1:].reshape(-1).to(ce.dtype).to(ce.device)
+        return (ce * w).sum() / w.sum().clamp(min=1e-6)
 
-    def observe(self, text, learn=True, max_length=2048):
+    def _assistant_labels(self, ids, offsets, text):
+        """completion-weighted labels. Assistant-span tokens get
+        weight 1.0; everything else gets prompt_loss_weight (default 0.1).
+        Returns None when the text has no chat-template markers."""
+        import torch
+        spans = [m.span(1) for m in _ASSISTANT_RE.finditer(text)]
+        if not spans:
+            return None
+        keep = torch.zeros(ids.shape[1], dtype=torch.bool)
+        for i, (s, e) in enumerate(offsets.tolist()):
+            if s == e:                       # special token
+                continue
+            for (as_, ae) in spans:
+                if s < ae and e > as_:       # overlap with assistant span
+                    keep[i] = True
+                    break
+        if keep.sum() < 2:                   # nothing learnable -> no mask
+            return None
+        weights = torch.full((1, ids.shape[1]), float(self.prompt_loss_weight))
+        weights[0, keep] = 1.0
+        return weights
+
+    def _lr_scale(self, e):
+        """graded plasticity — lr_t = lr * sigmoid(z-score of surprise)."""
+        import math
+        if not self.neuromod or self.mean is None or not self.var:
+            return 1.0
+        z = (e - self.mean) / (self.var ** 0.5 + 1e-6)
+        return 1.0 / (1.0 + math.exp(-z))
+
+    def observe(self, text, learn=True, max_length=2048, update_gate_stats=True,
+                prompt_weight=None):
         """Predict `text`; if surprised, rewrite the fast weights (bounded).
+
+        single forward — the surprise NLL and the training loss share
+        one forward pass (graph is discarded if the gate does not fire).
+        pass update_gate_stats=False for rehearsal/replay so old, easy
+        documents do not drag the EMA surprise mean down.
+
         Returns the pre-update NLL (the surprise)."""
         import torch
-        ids = self.tok(text, return_tensors="pt", truncation=True,
-                       max_length=max_length).input_ids.to(self.device)
+        enc = self.tok(text, return_tensors="pt", truncation=True,
+                       max_length=max_length, return_offsets_mapping=True)
+        ids = enc.input_ids.to(self.device)
         if ids.shape[1] < 2:
+            self.last_fired = False
             return None
-        with torch.no_grad():
-            e = self._nll(ids).item()
+        # prompt_weight=1.0 -> uniform loss (curated short docs need full
+        # prompt binding for retrieval); default (None) -> self.prompt_loss_weight
+        if prompt_weight is not None and prompt_weight >= 1.0:
+            weights = None
+        else:
+            _saved = self.prompt_loss_weight
+            if prompt_weight is not None:
+                self.prompt_loss_weight = prompt_weight
+            weights = self._assistant_labels(ids, enc.offset_mapping[0], text)
+            self.prompt_loss_weight = _saved
+
+        if learn:
+            loss = self._nll(ids, weights)               # one forward, with graph
+            e = loss.item()
+        else:
+            with torch.no_grad():
+                e = self._nll(ids, weights).item()
+
         fire = (self.mean is None) or (e > self.mean + self.k_gate * abs(self.mean))
-        self.mean = e if self.mean is None else self.beta * self.mean + (1 - self.beta) * e
+        if update_gate_stats:
+            if self.mean is None:
+                self.mean, self.var = e, 0.0
+            else:
+                d = e - self.mean
+                self.mean = self.beta * self.mean + (1 - self.beta) * e
+                self.var = self.beta * (self.var or 0.0) + (1 - self.beta) * d * d
+
+        self.last_fired = bool(learn and fire)
         if learn and fire:
-            loss = self._nll(ids)
+            scale = self._lr_scale(e)
             self.opt.zero_grad()
             loss.backward()
+            # clip HEAD only (parity with validated recipe): deep params
+            # were never clipped — clipping the joint norm throttled deep
+            # fact-storage gradients and regressed fact recall (T6 2/8)
             torch.nn.utils.clip_grad_norm_([self.head.A, self.head.B], 1.0)
-            self.opt.step()
+            if scale != 1.0:
+                old = [g["lr"] for g in self.opt.param_groups]
+                for g in self.opt.param_groups:
+                    g["lr"] *= scale
+                self.opt.step()
+                for g, lr in zip(self.opt.param_groups, old):
+                    g["lr"] = lr
+            else:
+                self.opt.step()
             with torch.no_grad():
                 self.head.B.mul_(self.decay)      # EMA decay = bounded plasticity
+                if self.max_B_norm is not None:   # hard Frobenius bound
+                    n = self.head.B.norm()
+                    if n > self.max_B_norm:
+                        self.head.B.mul_(self.max_B_norm / n)
+        elif learn:
+            self.opt.zero_grad(set_to_none=True)  # discard unused graph
+            del loss
         return e
 
     # ---------------- chat ----------------
@@ -123,7 +233,10 @@ class StrandsPlasticQwen:
         import torch
         msgs = [{"role": "user", "content": user_msg}]
         ids = self.tok.apply_chat_template(
-            msgs, add_generation_prompt=True, return_tensors="pt").to(self.device)
+            msgs, add_generation_prompt=True, return_tensors="pt")
+        if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
+            ids = ids["input_ids"]
+        ids = ids.to(self.device)
         with torch.no_grad():
             out = self.model.generate(
                 input_ids=ids, max_new_tokens=max_new_tokens,
@@ -137,19 +250,26 @@ def _plastic_head_cls():
     import torch.nn as nn
 
     class PlasticHead(nn.Module):
-        """Fast LoRA on lm_head: y = base(x) + scale*(x A)B. Only A,B change."""
+        """Fast LoRA on lm_head: y = base(x) + scale*(x A)B. Only A,B change.
+
+        A/B live in fp32 even when the base is bf16 — small SGD steps
+        would otherwise round to zero."""
         def __init__(self, base, r=16, scale=2.0):
             super().__init__()
             self.base = base
             for p in base.parameters():
                 p.requires_grad_(False)
-            dev, dt = base.weight.device, base.weight.dtype
-            self.A = nn.Parameter(torch.randn(base.in_features, r, device=dev, dtype=dt) * 0.01)
-            self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev, dtype=dt))
+            dev = base.weight.device
+            self.A = nn.Parameter(torch.randn(base.in_features, r, device=dev,
+                                              dtype=torch.float32) * 0.01)
+            self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev,
+                                              dtype=torch.float32))
             self.scale = scale
 
         def forward(self, x):
-            return self.base(x) + self.scale * ((x @ self.A) @ self.B)
+            y = self.base(x)
+            delta = (x.to(torch.float32) @ self.A) @ self.B
+            return y + self.scale * delta.to(y.dtype)
 
     return PlasticHead
 

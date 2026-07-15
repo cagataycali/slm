@@ -13,10 +13,12 @@ Mechanism (validated in README.md / demo.ipynb):
   frozen Qwen3-VL-2B (strands-expert) + plastic LoRA head, surprise-gated SGD +
   EMA decay. After every turn the full transcript is observed with learn=True.
   reset() -> bit-identical to base. save/load fast weights for persistence.
+
 """
 import json
 import logging
 import os
+import random
 from typing import Any, AsyncIterable, Optional
 
 from strands.types.content import Messages
@@ -30,6 +32,9 @@ PLASTICITY = {
     #            lr,    decay,  r_fast, k_gate
     "off":      (0.0,   1.0,    16,  1e9),
     "low":      (8e-3,  0.98,   16,  0.0),     # production: retention Δ≈0
+    # NOTE: k_gate=-10 => gate ~always open (learn every observe). Because the
+    # surprise NLL and training loss share a single forward, this no longer
+    # costs an extra forward pass.
     "medium":   (2e-2,  0.995,  64, -10.0),
     "high":     (5e-2,  0.999,  128, -10.0),   # demo-validated: visible learning
 }
@@ -39,7 +44,7 @@ class SLM(Model):
     """Self-learning Strands model: every turn updates the fast weights."""
 
     def __init__(self, model_id: str = "cagataydev/strands-qwen3-vl-2b",
-                 device: str = "cuda", plasticity: str = "high",
+                 device: Optional[str] = None, plasticity: str = "high",
                  placement: str = "deep", deep_blocks: int = 6, deep_r: int = 32,
                  learn_on_turn: bool = True, learn_epochs: int = 1,
                  max_tokens: int = 1024, temperature: float = 0.0,
@@ -48,7 +53,9 @@ class SLM(Model):
         lr, decay, r_fast, k_gate = PLASTICITY[plasticity]
         self._m = StrandsPlasticQwen.from_pretrained(
             model_id, device=device, r_fast=r_fast, lr=lr, decay=decay,
-            k_gate=k_gate, token=token)
+            k_gate=k_gate, token=token,
+            max_B_norm=kwargs.get("max_B_norm"),
+            neuromod=kwargs.get("neuromod", False))
         # cycle-6 finding: plastic LoRA on q/v_proj of the last-k attention
         # blocks stores fact bindings ~4x more sample-efficiently and with far
         # less retention damage than the head alone.
@@ -69,6 +76,7 @@ class SLM(Model):
         self.replay_buffer = []         # past turn transcripts (for rehearsal)
         self.replay_k = int(kwargs.get("replay_k", 3))
         self.replay_cap = int(kwargs.get("replay_cap", 64))
+        self._buffer_seen = 0           # reservoir-sampling counter
 
     # ---------- strands Model interface ----------
     def update_config(self, **model_config: Any) -> None:
@@ -85,21 +93,30 @@ class SLM(Model):
                      system_prompt: Optional[str] = None,
                      **kwargs: Any) -> AsyncIterable[StreamEvent]:
         """Generate a reply; then LEARN from the full turn transcript."""
+        import asyncio
         import torch
 
         chat = self._to_chat(messages, system_prompt, tool_specs)
         ids = self._m.tok.apply_chat_template(
             chat, add_generation_prompt=True, return_tensors="pt",
-            tools=self._tools_for_template(tool_specs)).to(self._m.device)
+            tools=self._tools_for_template(tool_specs))
+        if not torch.is_tensor(ids):        # newer transformers -> BatchEncoding
+            ids = ids["input_ids"]
+        ids = ids.to(self._m.device)
 
         temp = float(self.config.get("temperature", 0.0))
-        with torch.no_grad():
-            out = self._m.model.generate(
-                input_ids=ids,
-                max_new_tokens=int(self.config.get("max_tokens", 1024)),
-                do_sample=temp > 0, temperature=max(temp, 1e-5),
-                repetition_penalty=float(self.config.get("repetition_penalty", 1.1)),
-                pad_token_id=self._m.tok.eos_token_id)
+
+        def _generate():
+            with torch.no_grad():
+                return self._m.model.generate(
+                    input_ids=ids,
+                    max_new_tokens=int(self.config.get("max_tokens", 1024)),
+                    do_sample=temp > 0, temperature=max(temp, 1e-5),
+                    repetition_penalty=float(self.config.get("repetition_penalty", 1.1)),
+                    pad_token_id=self._m.tok.eos_token_id)
+
+        # keep the event loop responsive
+        out = await asyncio.to_thread(_generate)
         text = self._m.tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
 
         tool_use = self._parse_tool_call(text)
@@ -125,26 +142,43 @@ class SLM(Model):
 
         # ---- THE POINT: learn from this turn (with replay rehearsal) ----
         if self.learn_on_turn:
-            import random as _random
             transcript = self._transcript(messages, text)
-            e = None
-            for _ in range(self.learn_epochs):
-                e = self._m.observe(transcript, learn=True)
-                # rehearse k random past transcripts to prevent interference
-                # (cycle-3 finding: interleaving keeps old knowledge alive)
-                if self.replay_buffer and self.replay_k > 0:
-                    for past in _random.sample(
-                            self.replay_buffer,
-                            min(self.replay_k, len(self.replay_buffer))):
-                        self._m.observe(past, learn=True)
-            self.replay_buffer.append(transcript)
-            if len(self.replay_buffer) > self.replay_cap:
-                self.replay_buffer.pop(0)
+
+            def _learn():
+                e = None
+                for _ in range(self.learn_epochs):
+                    e = self._m.observe(transcript, learn=True)
+                    # rehearse k random past transcripts to prevent interference
+                    # (cycle-3 finding: interleaving keeps old knowledge alive)
+                    # rehearsal must NOT update the surprise EMA
+                    if self.replay_buffer and self.replay_k > 0:
+                        for past in random.sample(
+                                self.replay_buffer,
+                                min(self.replay_k, len(self.replay_buffer))):
+                            self._m.observe(past, learn=True,
+                                            update_gate_stats=False)
+                return e
+
+            # backward passes off the event loop
+            e = await asyncio.to_thread(_learn)
+            self._buffer_add(transcript)
             self.turn_count += 1
             if e is not None:
                 self.surprise_log.append((self.turn_count, e))
                 logger.debug("SLM turn %d: surprise %.3f (weights updated)",
                              self.turn_count, e)
+
+    def _buffer_add(self, doc: str):
+        """reservoir sampling past capacity — every lesson ever seen
+        has equal probability of remaining, instead of FIFO evicting the
+        oldest (and often most foundational) lessons."""
+        self._buffer_seen += 1
+        if len(self.replay_buffer) < self.replay_cap:
+            self.replay_buffer.append(doc)
+        else:
+            j = random.randrange(self._buffer_seen)
+            if j < self.replay_cap:
+                self.replay_buffer[j] = doc
 
     def _inject_deep(self, k_blocks: int, r: int, lr: float, decay: float):
         """Attach plastic LoRA to q_proj/v_proj of the last k attention blocks."""
@@ -152,18 +186,23 @@ class SLM(Model):
         import torch.nn as nn
 
         class _DeepLoRA(nn.Module):
+            """A/B in fp32 even on bf16 bases."""
             def __init__(self, base, r=32, scale=2.0):
                 super().__init__()
                 self.base = base
                 for p in base.parameters():
                     p.requires_grad_(False)
-                dev, dt = base.weight.device, base.weight.dtype
-                self.A = nn.Parameter(torch.randn(base.in_features, r, device=dev, dtype=dt) * 0.01)
-                self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev, dtype=dt))
+                dev = base.weight.device
+                self.A = nn.Parameter(torch.randn(base.in_features, r, device=dev,
+                                                  dtype=torch.float32) * 0.01)
+                self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev,
+                                                  dtype=torch.float32))
                 self.scale = scale
 
             def forward(self, x):
-                return self.base(x) + self.scale * ((x @ self.A) @ self.B)
+                y = self.base(x)
+                delta = (x.to(torch.float32) @ self.A) @ self.B
+                return y + self.scale * delta.to(y.dtype)
 
         inner = self._m.model.model
         layers = (inner.language_model.layers
@@ -182,10 +221,17 @@ class SLM(Model):
         # wrap observe to decay deep B matrices too
         _orig_observe = self._m.observe
 
-        def observe_with_deep_decay(text, learn=True, max_length=2048):
+        def observe_with_deep_decay(text, learn=True, max_length=2048,
+                                    update_gate_stats=True, prompt_weight=None):
             import torch as _t
-            e = _orig_observe(text, learn=learn, max_length=max_length)
-            if learn:
+            e = _orig_observe(text, learn=learn, max_length=max_length,
+                              update_gate_stats=update_gate_stats,
+                              prompt_weight=prompt_weight)
+            # decay deep B only when the gate actually fired — the
+            # same condition under which the head B decays. Previously deep
+            # knowledge decayed on every learn=True call, so it faded faster
+            # than head knowledge in low-plasticity mode.
+            if learn and self._m.last_fired:
                 with _t.no_grad():
                     for p in self._deep_params[1::2]:
                         p.mul_(self._deep_decay)
@@ -194,11 +240,14 @@ class SLM(Model):
         self._m.observe = observe_with_deep_decay
 
     # ---------- self-learning API (beyond the Model interface) ----------
-    def observe(self, text: str, learn: bool = True, epochs: int = 1):
+    def observe(self, text: str, learn: bool = True, epochs: int = 1,
+                update_gate_stats: bool = True):
         """Directly feed text to learn from (returns pre-update NLL)."""
         e = None
-        for _ in range(epochs):
-            e = self._m.observe(text, learn=learn)
+        for i in range(epochs):
+            # only the FIRST exposure is a genuine surprise sample
+            e = self._m.observe(text, learn=learn,
+                                update_gate_stats=update_gate_stats and i == 0)
         return e
 
     def teach(self, prompt: str, response: str, epochs: int = 3,
@@ -225,11 +274,13 @@ class SLM(Model):
             if not (prompt_key in d and response.strip()[:40] not in d)
         ]
         e = None
-        for _ in range(epochs):
-            e = self._m.observe(doc, learn=True)
-        self.replay_buffer.append(doc)
-        if len(self.replay_buffer) > self.replay_cap:
-            self.replay_buffer.pop(0)
+        for i in range(epochs):
+            # repeated epochs on the same doc must not drag the EMA down.
+            # prompt_weight=1.0: curated bindings need FULL prompt-familiarity
+            # (weighted loss alone regressed fact recall T6 to 4/8)
+            e = self._m.observe(doc, learn=True, update_gate_stats=(i == 0),
+                                prompt_weight=1.0)
+        self._buffer_add(doc)
         return e
 
     def revise(self, prompt: str, old_response: str, new_response: str,
@@ -253,19 +304,28 @@ class SLM(Model):
             return self._m.tok.apply_chat_template(
                 [{"role": "user", "content": u},
                  {"role": "assistant", "content": a}], tokenize=False)
+
+        def _enc(doc):
+            # completion-only masking here too: ascent/descent only on assistant tokens
+            enc = self._m.tok(doc, return_tensors="pt",
+                              return_offsets_mapping=True)
+            ids = enc.input_ids.to(self._m.device)
+            labels = self._m._assistant_labels(ids, enc.offset_mapping[0], doc)
+            return ids, labels
+
         params = self._deep_params + [self._m.head.A, self._m.head.B]
         opt = torch.optim.SGD(params, lr=lr)
-        old_ids = self._m.tok(_doc(prompt, old_response),
-                              return_tensors="pt").input_ids.to(self._m.device)
-        new_ids = self._m.tok(_doc(prompt, new_response),
-                              return_tensors="pt").input_ids.to(self._m.device)
+        old_ids, old_lab = _enc(_doc(prompt, old_response))
+        new_ids, new_lab = _enc(_doc(prompt, new_response))
         for _ in range(steps):
-            loss = -self._m._nll(old_ids)          # ascent: forget old
-            opt.zero_grad(); loss.backward()
+            loss = -self._m._nll(old_ids, old_lab)  # ascent: forget old
+            opt.zero_grad()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 0.5)
             opt.step()
-            loss = self._m._nll(new_ids)           # descent: learn new
-            opt.zero_grad(); loss.backward()
+            loss = self._m._nll(new_ids, new_lab)   # descent: learn new
+            opt.zero_grad()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 0.5)
             opt.step()
         # purge stale buffer lessons (prompt + old response) so future sleeps
@@ -275,7 +335,7 @@ class SLM(Model):
         self.replay_buffer = [d for d in self.replay_buffer
                               if not (pk in d and ok_ in d)]
         # store the new binding as a lesson
-        self.replay_buffer.append(_doc(prompt, new_response))
+        self._buffer_add(_doc(prompt, new_response))
         return {"steps": steps, "purged": before - len(self.replay_buffer) + 1}
 
     def consolidate(self, epochs: int = 5, lr_boost: float = 1.0):
@@ -287,7 +347,6 @@ class SLM(Model):
 
         Returns mean surprise over the last replay epoch.
         """
-        import random as _random
         if not self.replay_buffer:
             return None
         old_lrs = [g["lr"] for g in self._m.opt.param_groups]
@@ -297,8 +356,11 @@ class SLM(Model):
         try:
             for _ in range(epochs):
                 docs = list(self.replay_buffer)
-                _random.shuffle(docs)
-                es = [self._m.observe(d, learn=True) for d in docs]
+                random.shuffle(docs)
+                # sleep replay must not pollute the wake surprise EMA
+                es = [self._m.observe(d, learn=True, update_gate_stats=False,
+                                      prompt_weight=1.0)
+                      for d in docs]
                 es = [e for e in es if e is not None]
                 last = sum(es) / max(len(es), 1)
         finally:
@@ -318,16 +380,27 @@ class SLM(Model):
         self.turn_count = 0
         self.surprise_log = []
         self.replay_buffer = []
+        self._buffer_seen = 0
 
-    def save_fast_weights(self, path: str):
+    def save_fast_weights(self, path: str, include_transcripts: bool = True):
+        """Persist the fast weights (and, optionally, the replay buffer).
+
+        pass include_transcripts=False before PUBLISHING an experience
+        file — the replay buffer contains verbatim user conversations.
+        """
         import torch
+        if include_transcripts:
+            logger.warning(
+                "save_fast_weights: replay buffer (verbatim transcripts) is "
+                "included — use include_transcripts=False before publishing.")
         torch.save({"A": self._m.head.A.detach().cpu(),
                     "B": self._m.head.B.detach().cpu(),
                     "deep": [p.detach().cpu() for p in self._deep_params],
                     "turn_count": self.turn_count,
                     "plasticity": self.plasticity,
                     "placement": self.placement,
-                    "replay_buffer": list(self.replay_buffer)}, path)
+                    "replay_buffer": list(self.replay_buffer)
+                                     if include_transcripts else []}, path)
 
     def load_experience_from_hf(self, repo: str = "cagataydev/self-learning-model",
                                 filename: str = "slm_agent/marathon_experience.pt",
@@ -357,9 +430,10 @@ class SLM(Model):
                       "relearn" (buffer merge + observe passes, handles conflicts)
         """
         import torch
-        import random as _random
         import re as _re
-        ckpts = [torch.load(p, map_location=self._m.device) for p in paths]
+        # weights_only=True — no arbitrary pickle execution
+        ckpts = [torch.load(p, map_location=self._m.device, weights_only=True)
+                 for p in paths]
 
         # C41 guardrail: detect conflicting lessons (same user prompt, different
         # assistant response) across checkpoints. SUM on conflicts corrupts
@@ -400,10 +474,10 @@ class SLM(Model):
             lessons = []
             for c in ckpts:
                 lessons.extend(c.get("replay_buffer", []))
-            _random.Random(0).shuffle(lessons)
+            random.Random(0).shuffle(lessons)
             for _ in range(3):
                 for d in lessons:
-                    self._m.observe(d, learn=True)
+                    self._m.observe(d, learn=True, update_gate_stats=False)
             self.replay_buffer = lessons[-self.replay_cap:]
         else:
             raise ValueError(f"unknown strategy: {strategy}")
@@ -418,7 +492,8 @@ class SLM(Model):
 
     def load_fast_weights(self, path: str):
         import torch
-        ckpt = torch.load(path, map_location=self._m.device)
+        # weights_only=True — tensors/str/primitives only, no pickle RCE
+        ckpt = torch.load(path, map_location=self._m.device, weights_only=True)
         with torch.no_grad():
             self._m.head.A.copy_(ckpt["A"].to(self._m.head.A.dtype))
             self._m.head.B.copy_(ckpt["B"].to(self._m.head.B.dtype))
@@ -426,6 +501,7 @@ class SLM(Model):
                 p.copy_(saved.to(p.dtype).to(p.device))
         self.turn_count = ckpt.get("turn_count", 0)
         self.replay_buffer = list(ckpt.get("replay_buffer", []))
+        self._buffer_seen = len(self.replay_buffer)
 
     # ---------- helpers ----------
     @staticmethod
@@ -479,7 +555,8 @@ class SLM(Model):
     @staticmethod
     def _parse_tool_call(text: str):
         """Parse Qwen-style <tool_call>{...}</tool_call> from generated text."""
-        import re, uuid
+        import re
+        import uuid
         mm = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
         if not mm:
             return None

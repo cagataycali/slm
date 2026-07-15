@@ -9,7 +9,7 @@ Run:  BYPASS_TOOL_CONSENT=true .venv/bin/python try_agent.py
     you> /reset                                                      # off-switch
 
 Commands: /ask <q> (weights-only answer) · /teach <prompt> | <response> ·
-/observe <text> · /surprise · /save · /load · /reset · /quit.
+/observe <text> · /surprise · /auto (toggle per-turn curation) ·\n/save · /load · /reset · /quit.
 Anything else is a normal agent turn (shell tool) — it learns from the transcript.
 """
 import os
@@ -23,7 +23,12 @@ SYSTEM = "You are a helpful assistant with shell access. Be brief."
 CKPT = "/tmp/slm_try_agent.pt"
 
 print("loading model (plasticity=high, deep placement)...")
-m = SLM(plasticity="high", placement="deep", max_tokens=256, replay_k=2)
+# prompt_loss_weight=1.0: user/tool tokens learn at FULL weight (equal to
+# assistant). Trade-off: disables the E16 anti-poisoning damping — anything
+# pasted into the chat (tool output, injected text) also learns at 1.0.
+m = SLM(plasticity="high", placement="deep", max_tokens=256, replay_k=2,
+        prompt_loss_weight=1.0)
+AUTO_TEACH = True   # curate (question -> answer) each turn; /auto toggles
 agent = Agent(model=m, tools=[shell], callback_handler=None, system_prompt=SYSTEM)
 TOOL_SPECS = agent.tool_registry.get_all_tool_specs()
 norm = lambda: m._m.head.B.norm().item()
@@ -57,10 +62,18 @@ while True:
         m.load_fast_weights(arg or CKPT); print(f"[load] ||B||={norm():.4f}")
     elif cmd == "/reset":
         m.reset(); print(f"[reset] bit-exact base model. ||B||={norm():.4f}")
+    elif cmd == "/auto":
+        AUTO_TEACH = not AUTO_TEACH
+        print(f"[auto-teach] {'ON — each turn curates (q -> answer)' if AUTO_TEACH else 'OFF — transcript-only learning'}")
     else:  # agent turn — history cleared each turn so answers come from WEIGHTS
         agent.messages = []
         before = norm()
-        print(f"\nagent> {agent(q)}")
+        reply = agent(q)
+        print(f"\nagent> {reply}")
+        if AUTO_TEACH:
+            # E41: raw transcripts teach form, not facts — curate the pair so
+            # conversational facts stick by default.
+            m.teach(q, str(reply).strip(), epochs=1)
         print(f"[learned: ||B|| {before:.4f} -> {norm():.4f}]")
 
 print("bye — weights not saved unless you used /save")

@@ -65,7 +65,8 @@ class SLM(Model):
             model_id, device=device, r_fast=r_fast, lr=lr, decay=decay,
             k_gate=k_gate, token=token,
             max_B_norm=kwargs.get("max_B_norm"),
-            neuromod=kwargs.get("neuromod", False))
+            neuromod=kwargs.get("neuromod", False),
+            prompt_loss_weight=kwargs.get("prompt_loss_weight", 0.1))
         # cycle-6 finding: plastic LoRA on q/v_proj of the last-k attention
         # blocks stores fact bindings ~4x more sample-efficiently and with far
         # less retention damage than the head alone.
@@ -141,13 +142,17 @@ class SLM(Model):
         def _generate():
             # runs in a worker thread: hold the learn RLock so generation
             # never overlaps a direct-API thread's backward/step (QA-18)
+            gen_kwargs = dict(
+                input_ids=ids,
+                max_new_tokens=int(self.config.get("max_tokens", 1024)),
+                repetition_penalty=float(self.config.get("repetition_penalty", 1.1)),
+                pad_token_id=self._m.tok.eos_token_id)
+            if temp > 0:
+                gen_kwargs.update(do_sample=True, temperature=temp)
+            else:
+                gen_kwargs["do_sample"] = False
             with self._m.learn_lock, torch.no_grad():
-                return self._m.model.generate(
-                    input_ids=ids,
-                    max_new_tokens=int(self.config.get("max_tokens", 1024)),
-                    do_sample=temp > 0, temperature=max(temp, 1e-5),
-                    repetition_penalty=float(self.config.get("repetition_penalty", 1.1)),
-                    pad_token_id=self._m.tok.eos_token_id)
+                return self._m.model.generate(**gen_kwargs)
 
         # serialize generate+learn across concurrent turns — the optimizer,
         # backward graph and plastic A/B are shared mutable state.

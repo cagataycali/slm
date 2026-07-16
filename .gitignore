@@ -10,3 +10,5 @@ scripts/corpus.jsonl
 *.pt
 .DS_Store
 slm/_version.py
+.autonomous/
+papers/

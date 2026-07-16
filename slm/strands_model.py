@@ -51,7 +51,8 @@ class SLM(Model):
                  learn_on_turn: bool = True, learn_epochs: int = 1,
                  max_tokens: int = 1024, temperature: float = 0.0,
                  enable_thinking: Optional[bool] = None,
-                 token: Optional[str] = None, **kwargs):
+                 token: Optional[str] = None, meta_state: Optional[str] = None,
+                 **kwargs):
         from .qwen import StrandsPlasticQwen
         lr, decay, r_fast, k_gate = PLASTICITY[plasticity]
         # amb_E18 fix: honor explicit overrides — previously SLM(k_gate=...)
@@ -61,22 +62,35 @@ class SLM(Model):
         decay = kwargs.pop("decay", decay)
         k_gate = kwargs.pop("k_gate", k_gate)
         r_fast = kwargs.pop("r_fast", r_fast)
+        # momentum=0.5 default — measured (0.6B, 3-arm): learning-curve drop
+        # 0.84->1.28, bind median 2.5->1.0 rounds, retention +0.52->+0.28.
+        # 0.9 learns fastest but pays +1.98 NLL retention (too hot).
+        momentum = kwargs.pop("momentum", 0.5)
+        self._momentum = momentum
         self._m = StrandsPlasticQwen.from_pretrained(
             model_id, device=device, r_fast=r_fast, lr=lr, decay=decay,
             k_gate=k_gate, token=token,
             max_B_norm=kwargs.get("max_B_norm"),
             neuromod=kwargs.get("neuromod", False),
-            prompt_loss_weight=kwargs.get("prompt_loss_weight", 0.1))
+            prompt_loss_weight=kwargs.get("prompt_loss_weight", 0.1),
+            momentum=momentum,
+            adaptive_decay=kwargs.get("adaptive_decay", False))
         # cycle-6 finding: plastic LoRA on q/v_proj of the last-k attention
         # blocks stores fact bindings ~4x more sample-efficiently and with far
         # less retention damage than the head alone.
         self.placement = placement
         self._deep_params = []
+        self._deep_alphas = []   # per-channel gates (slow state, [A,B] pairs stay in _deep_params)
         if placement == "deep":
             # C8 finding: deep placement wants a cooler lr than the head —
             # 2e-2 learns with ZERO retention cost; 5e-2 pays ~0.8 NLL.
             deep_lr = min(lr, 2e-2) if plasticity == "high" else lr
             self._inject_deep(deep_blocks, deep_r, deep_lr, decay)
+        # meta-learned plastic init W0 (A matrices) +
+        # per-site lr multipliers, produced by scripts/meta_train.py. Slow
+        # model identity — B stays zero, reset() unaffected.
+        if meta_state:
+            self.load_meta_state(meta_state)
         self.plasticity = plasticity
         self.learn_on_turn = learn_on_turn and plasticity != "off"
         self.learn_epochs = learn_epochs
@@ -300,7 +314,9 @@ class SLM(Model):
         import torch.nn as nn
 
         class _DeepLoRA(nn.Module):
-            """A/B in fp32 even on bf16 bases."""
+            """A/B/alpha in fp32 even on bf16 bases. Per-channel learned gate
+            : y = base + 2*scale*tanh(alpha) ⊙ (xA)B,
+            alpha init atanh(0.5) -> effective mult == scale at init."""
             def __init__(self, base, r=32, scale=2.0):
                 super().__init__()
                 self.base = base
@@ -311,12 +327,16 @@ class SLM(Model):
                                                   dtype=torch.float32) * 0.01)
                 self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev,
                                                   dtype=torch.float32))
+                self.alpha = nn.Parameter(torch.full(
+                    (base.out_features,), 0.5493061443340549, device=dev,
+                    dtype=torch.float32))
                 self.scale = scale
 
             def forward(self, x):
                 y = self.base(x)
                 delta = (x.to(torch.float32) @ self.A) @ self.B
-                return y + self.scale * delta.to(y.dtype)
+                gate = (2.0 * self.scale) * torch.tanh(self.alpha)
+                return y + (delta * gate).to(y.dtype)
 
         inner = self._m.model.model
         layers = (inner.language_model.layers
@@ -339,16 +359,23 @@ class SLM(Model):
                 lora = _DeepLoRA(getattr(attn, name), r=r)
                 setattr(attn, name, lora)
                 self._deep_params += [lora.A, lora.B]
-        # single optimizer over deep + head fast weights
-        self._m.opt = torch.optim.SGD(
-            self._deep_params + [self._m.head.A, self._m.head.B], lr=lr)
+                self._deep_alphas.append(lora.alpha)
+        # single optimizer over deep + head fast weights; gates (alpha)
+        # learn online in a separate slow group (0.1x lr)
+        self._m.opt = torch.optim.SGD([
+            {"params": self._deep_params + [self._m.head.A, self._m.head.B],
+             "lr": lr},
+            {"params": self._deep_alphas + [self._m.head.alpha],
+             "lr": lr * 0.1},
+        ], lr=lr, momentum=getattr(self, "_momentum", 0.0))
         self._deep_decay = decay
         # wrap observe to decay deep B matrices too
         _orig_observe = self._m.observe
 
         def observe_with_deep_decay(text, learn=True, max_length=2048,
                                     update_gate_stats=True, prompt_weight=None,
-                                    force_fire=False):
+                                    force_fire=False, key_text=None,
+                                    key_weight=4.0):
             import torch as _t
             # QA-17: hold the (re-entrant) learn lock across observe AND the
             # deep decay — decaying outside it raced with another thread's
@@ -357,15 +384,24 @@ class SLM(Model):
                 e = _orig_observe(text, learn=learn, max_length=max_length,
                                   update_gate_stats=update_gate_stats,
                                   prompt_weight=prompt_weight,
-                                  force_fire=force_fire)
+                                  force_fire=force_fire, key_text=key_text,
+                                  key_weight=key_weight)
                 # decay deep B only when the gate actually fired — the
                 # same condition under which the head B decays. Previously deep
                 # knowledge decayed on every learn=True call, so it faded faster
                 # than head knowledge in low-plasticity mode.
                 if learn and self._m.last_fired:
                     with _t.no_grad():
+                        dd = self._deep_decay
+                        if (getattr(self._m, "adaptive_decay", False)
+                                and self._m.last_decay is not None
+                                and self._m.decay < 1.0):
+                            # mirror the head's surprise-adaptive factor,
+                            # rescaled to the deep base rate
+                            frac = (1.0 - self._m.last_decay) / (1.0 - self._m.decay)
+                            dd = 1.0 - (1.0 - self._deep_decay) * frac
                         for p in self._deep_params[1::2]:
-                            p.mul_(self._deep_decay)
+                            p.mul_(dd)
             return e
 
         self._m.observe = observe_with_deep_decay
@@ -382,7 +418,7 @@ class SLM(Model):
         return e
 
     def teach(self, prompt: str, response: str, epochs: int = 3,
-              rehearse: bool = True):
+              rehearse: bool = True, key: str = None, key_weight: float = 4.0):
         """Curated learning: bind (future query -> desired response) directly.
 
         Cycle-11 finding: raw feedback dialogues teach 'comply when instructed',
@@ -414,11 +450,54 @@ class SLM(Model):
             # repeated epochs on the same doc must not drag the EMA down.
             # prompt_weight=1.0: curated bindings need FULL prompt-familiarity
             # (weighted loss alone regressed fact recall T6 to 4/8)
+            # key: KVB-style focus — key tokens carry
+            # key_weight x loss so the (cue -> key) association binds fast.
             e = self._m.observe(doc, learn=True, update_gate_stats=(i == 0),
-                                prompt_weight=1.0, force_fire=True)
+                                prompt_weight=1.0, force_fire=True,
+                                key_text=key, key_weight=key_weight)
         self._buffer_add(doc, kind="curated", prompt=pk, response=rk,
                          source="teach")
         return e
+
+    def teach_batch(self, lessons, epochs: int = 3, key_weight: float = 4.0):
+        """Batched curated learning: one optimizer step per epoch over ALL
+        lessons (mini-batch TTT, TTT-E2E b>1).
+
+        MEASURED CAVEAT (0.6B, 8 facts): batching is the WRONG tool for fact
+        binding — averaging dilutes each fact's argmax-flip signal (recall
+        0-2/8 vs 5/8 sequential at equal compute). Its real profile is
+        gentle low-interference adaptation: retention cost +0.02 vs +2.67
+        NLL. Use sequential teach()/bind() for facts; use this for streams.
+
+        Args:
+            lessons: list of (prompt, response) or (prompt, response, key).
+        """
+        docs, keys = [], []
+        for item in lessons:
+            prompt, response = item[0], item[1]
+            key = item[2] if len(item) > 2 else None
+            chat = [{"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response}]
+            try:
+                with self._m.learn_lock:
+                    docs.append(self._m.tok.apply_chat_template(
+                        chat, tokenize=False, **self._tmpl_kw()))
+            except Exception:
+                docs.append(f"user: {prompt}\nassistant: {response}")
+            keys.append(key)
+            self._buffer_add(docs[-1], kind="curated", prompt=prompt.strip(),
+                             response=response.strip(), source="teach_batch")
+        es = None
+        for _ in range(epochs):
+            es = self._m.observe_batch(docs, prompt_weight=1.0,
+                                       key_texts=keys, key_weight=key_weight)
+            # deep decay parity (mirrors the per-observe wrapper, once/step)
+            if self._deep_params:
+                import torch as _t
+                with self._m.learn_lock, _t.no_grad():
+                    for p in self._deep_params[1::2]:
+                        p.mul_(self._deep_decay)
+        return es
 
     def revise(self, prompt: str, old_response: str, new_response: str,
                steps: int = 14, lr: float = 1e-2):
@@ -531,7 +610,7 @@ class SLM(Model):
     def bind(self, prompt: str, response: str,
              system_prompt: Optional[str] = None, tool_specs=None,
              key: Optional[str] = None, max_rounds: int = 12,
-             verbose: bool = True) -> bool:
+             verbose: bool = True, key_weight: float = 4.0) -> bool:
         """Teach a fact until greedy generation flips. Returns True on success.
 
         Displaces a consolidated prior via revise() when needed, then repeats
@@ -570,8 +649,10 @@ class SLM(Model):
                     **self._tmpl_kw()))
             except Exception:
                 pass
+        self.last_bind_rounds = None   # rounds-to-flip telemetry
         for round_ in range(1, max_rounds + 1):
-            self.teach(prompt, response, epochs=2)
+            self.teach(prompt, response, epochs=2, key=key,
+                       key_weight=key_weight)
             for d in docs:
                 self.observe(d, learn=True, epochs=1, update_gate_stats=False)
             g = self.ask(prompt, system_prompt)
@@ -581,6 +662,7 @@ class SLM(Model):
                             self.prob(prompt, response),
                             "HIT " if hit else "", g[:60])
             if hit:
+                self.last_bind_rounds = round_
                 return True
         return False
 
@@ -698,6 +780,52 @@ class SLM(Model):
                 g["lr"] = lr
         return last
 
+    def load_meta_state(self, path: str, apply_lr_mults: bool = False):
+        """Load meta-learned plastic init (W0), optionally per-site lrs.
+
+        Produced by scripts/meta_train.py. Copies the
+        meta A matrices into head/deep plastic params (B stays zero — this is
+        SLOW model identity, not experience; reset() semantics unchanged).
+
+        apply_lr_mults=False by default — MEASURED (0.6B, 3-arm ablation):
+        the meta A init alone improves both binding speed (median 2.5 -> 1.5
+        rounds) AND retention (+0.67 -> +0.61 NLL), while meta lr multipliers
+        help the light observe() budget they were trained on but COST
+        retention under heavy teach/bind loops (+1.0 to +2.9 NLL). Opt in
+        only for observe-dominated workloads.
+        """
+        import torch
+        ck = torch.load(path, map_location=self._m.device, weights_only=True)
+        hA = self._m.head.A
+        if tuple(ck["head_A"].shape) != tuple(hA.shape):
+            raise ValueError(
+                f"meta_state: head_A {tuple(ck['head_A'].shape)} != "
+                f"instance {tuple(hA.shape)} — match r_fast/plasticity")
+        deep_A = self._deep_params[0::2]
+        if len(ck.get("deep_A", [])) != len(deep_A):
+            raise ValueError(
+                f"meta_state: {len(ck.get('deep_A', []))} deep_A tensors vs "
+                f"instance {len(deep_A)} — match placement/deep_blocks")
+        with torch.no_grad():
+            hA.copy_(ck["head_A"].to(hA.dtype))
+            for p, saved in zip(deep_A, ck["deep_A"]):
+                p.copy_(saved.to(p.dtype).to(p.device))
+        mults = (ck.get("lr_mults", {"head": 1.0, "deep": 1.0})
+                 if apply_lr_mults else {"head": 1.0, "deep": 1.0})
+        base_lr = ck.get("base_lr",
+                         self._m.opt.param_groups[0]["lr"])
+        self._m.opt = torch.optim.SGD([
+            {"params": [self._m.head.A, self._m.head.B],
+             "lr": base_lr * mults.get("head", 1.0)},
+            {"params": list(self._deep_params),
+             "lr": base_lr * mults.get("deep", 1.0)},
+            {"params": self._deep_alphas + [self._m.head.alpha],
+             "lr": base_lr * 0.1},
+        ], lr=base_lr, momentum=getattr(self, "_momentum", 0.0))
+        self._meta_A = ([ck["head_A"].to(hA.device)]
+                        + [t.to(hA.device) for t in ck["deep_A"]])
+        logger.info("meta_state loaded: lr_mults=%s base_lr=%s", mults, base_lr)
+
     def reset(self):
         """Wipe all test-time learning -> exactly the base model."""
         import torch
@@ -707,11 +835,19 @@ class SLM(Model):
             for i in range(0, len(self._deep_params), 2):
                 nn.init.normal_(self._deep_params[i], std=0.01)
                 self._deep_params[i + 1].zero_()
+            # meta init is model identity: reset returns to IT, not to random
+            if getattr(self, "_meta_A", None):
+                self._m.head.A.copy_(self._meta_A[0].to(self._m.head.A.dtype))
+                for p, a in zip(self._deep_params[0::2], self._meta_A[1:]):
+                    p.copy_(a.to(p.dtype))
         self.turn_count = 0
         self.surprise_log = []
         self.audit_log = []
         self.replay_buffer = []
         self._buffer_seen = 0
+        # wipe momentum velocity: stale surprise-memory must not keep
+        # writing after the off-switch
+        self._m.opt.state.clear()
 
     def save_fast_weights(self, path: str, include_transcripts: bool = True):
         """Persist the fast weights (and, optionally, the replay buffer).
@@ -732,7 +868,10 @@ class SLM(Model):
         try:
             torch.save({"A": self._m.head.A.detach().cpu(),
                         "B": self._m.head.B.detach().cpu(),
+                        "alpha": self._m.head.alpha.detach().cpu(),
                         "deep": [p.detach().cpu() for p in self._deep_params],
+                        "deep_alpha": [p.detach().cpu()
+                                       for p in self._deep_alphas],
                         "turn_count": self.turn_count,
                         "plasticity": self.plasticity,
                         "placement": self.placement,
@@ -976,6 +1115,15 @@ class SLM(Model):
             hB.copy_(ckpt["B"].to(hB.dtype))
             for p, saved in zip(self._deep_params, deep_saved):
                 p.copy_(saved.to(p.dtype).to(p.device))
+            # gates: optional (pre-gate checkpoints load fine — init kept)
+            a = ckpt.get("alpha")
+            ha = self._m.head.alpha
+            if a is not None and tuple(a.shape) == tuple(ha.shape):
+                ha.copy_(a.to(ha.dtype))
+            da = ckpt.get("deep_alpha", [])
+            if len(da) == len(self._deep_alphas):
+                for p, saved in zip(self._deep_alphas, da):
+                    p.copy_(saved.to(p.dtype).to(p.device))
         self.turn_count = ckpt.get("turn_count", 0)
         # legacy checkpoints stored plain strings — wrap into entries
         self.replay_buffer = [

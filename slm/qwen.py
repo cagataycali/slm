@@ -105,7 +105,8 @@ class StrandsPlasticQwen:
     """Strands-expert Qwen3-VL-2B + fast plastic LoRA head (self-learning at inference)."""
 
     def __init__(self, model, tok, head, lr=8e-3, decay=0.98, k_gate=0.0,
-                 max_B_norm=None, neuromod=False, prompt_loss_weight=0.1):
+                 max_B_norm=None, neuromod=False, prompt_loss_weight=0.1,
+                 momentum=0.0, adaptive_decay=False):
         import threading
         import torch
         self.model, self.tok, self.head = model, tok, head
@@ -115,7 +116,15 @@ class StrandsPlasticQwen:
         self.learn_lock = threading.RLock()
         # keep the END of long documents (assistant answer lives there)
         self.tok.truncation_side = "left"
-        self.opt = torch.optim.SGD([head.A, head.B], lr=lr)
+        # momentum = memory of surprise across updates (Titans eq.13): a
+        # surprising doc keeps writing for a few steps after the gate fires.
+        self.momentum = momentum
+        self.adaptive_decay = adaptive_decay
+        self.last_decay = None            # observability
+        self.opt = torch.optim.SGD([
+            {"params": [head.A, head.B], "lr": lr},
+            {"params": [head.alpha], "lr": lr * 0.1},   # gate: slow online learning
+        ], lr=lr, momentum=momentum)
         self.decay, self.k_gate = decay, k_gate
         self.mean, self.beta = None, 0.9
         self.var = None                    # EMA variance (neuromod)
@@ -271,6 +280,36 @@ class StrandsPlasticQwen:
         weights[0, keep] = 1.0
         return weights
 
+    def _key_weights(self, ids, offsets, text, key_text, key_weight,
+                     weights):
+        """Upweight tokens overlapping occurrences of key_text (KVB focus).
+
+        Returns a [1, T] weight tensor: `weights` (or uniform 1.0 when None)
+        with key-token positions multiplied up to `key_weight`. Case-
+        insensitive substring match on the rendered doc."""
+        import torch
+        low, klow = text.lower(), key_text.lower()
+        spans, start = [], 0
+        while True:
+            i = low.find(klow, start)
+            if i < 0:
+                break
+            spans.append((i, i + len(key_text)))
+            start = i + 1
+        if not spans:
+            return weights
+        if weights is None:
+            weights = torch.ones(1, ids.shape[1])
+        off = offsets.tolist()
+        for j, (s, e) in enumerate(off):
+            if s == e:
+                continue
+            for (ks, ke) in spans:
+                if s < ke and e > ks:
+                    weights[0, j] = max(float(weights[0, j]), 1.0) * key_weight
+                    break
+        return weights
+
     def _lr_scale(self, e):
         """graded plasticity — lr_t = lr * sigmoid(z-score of surprise)."""
         import math
@@ -280,7 +319,8 @@ class StrandsPlasticQwen:
         return 1.0 / (1.0 + math.exp(-z))
 
     def observe(self, text, learn=True, max_length=2048, update_gate_stats=True,
-                prompt_weight=None, force_fire=False):
+                prompt_weight=None, force_fire=False, key_text=None,
+                key_weight=4.0):
         """Predict `text`; if surprised, rewrite the fast weights (bounded).
 
         single forward — the surprise NLL and the training loss share
@@ -296,10 +336,11 @@ class StrandsPlasticQwen:
         with self.learn_lock:
             return self._observe_locked(text, learn, max_length,
                                         update_gate_stats, prompt_weight,
-                                        force_fire)
+                                        force_fire, key_text, key_weight)
 
     def _observe_locked(self, text, learn, max_length, update_gate_stats,
-                        prompt_weight, force_fire):
+                        prompt_weight, force_fire, key_text=None,
+                        key_weight=4.0):
         import torch
         enc = self.tok(text, return_tensors="pt", truncation=True,
                        max_length=max_length, return_offsets_mapping=True)
@@ -314,6 +355,13 @@ class StrandsPlasticQwen:
         else:
             weights = self._assistant_labels(ids, enc.offset_mapping[0], text,
                                              prompt_weight=prompt_weight)
+        # KVB-style focus: upweight the KEY tokens —
+        # the distinctive answer tokens bind() verifies — so the gradient
+        # concentrates on the (cue -> key token) association instead of
+        # spreading uniformly. Works with uniform weights too (curated docs).
+        if key_text:
+            weights = self._key_weights(ids, enc.offset_mapping[0], text,
+                                        key_text, key_weight, weights)
 
         if learn:
             loss = self._nll(ids, weights)               # one forward, with graph
@@ -343,7 +391,8 @@ class StrandsPlasticQwen:
             # clip HEAD only (parity with validated recipe): deep params
             # were never clipped — clipping the joint norm throttled deep
             # fact-storage gradients and regressed fact recall (T6 2/8)
-            torch.nn.utils.clip_grad_norm_([self.head.A, self.head.B], 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [self.head.A, self.head.B, self.head.alpha], 1.0)
             if scale != 1.0:
                 old = [g["lr"] for g in self.opt.param_groups]
                 for g in self.opt.param_groups:
@@ -354,7 +403,18 @@ class StrandsPlasticQwen:
             else:
                 self.opt.step()
             with torch.no_grad():
-                self.head.B.mul_(self.decay)      # EMA decay = bounded plasticity
+                # data-dependent decay (Titans-style adaptive forgetting):
+                # high-surprise updates decay LESS this turn (protect the fresh
+                # write), low-surprise ones decay at the base rate. z-score of
+                # the pre-update NLL against the EMA surprise stats.
+                d = self.decay
+                if self.adaptive_decay and self.mean is not None and self.var:
+                    z = (e - self.mean) / (self.var ** 0.5 + 1e-6)
+                    if z > 0:
+                        # shrink the forgetting amount (1-decay) by up to 2x
+                        d = 1.0 - (1.0 - self.decay) / (1.0 + min(z, 3.0))
+                self.last_decay = d
+                self.head.B.mul_(d)               # EMA decay = bounded plasticity
                 if self.max_B_norm is not None:   # hard Frobenius bound
                     n = self.head.B.norm()
                     if n > self.max_B_norm:
@@ -363,6 +423,60 @@ class StrandsPlasticQwen:
             self.opt.zero_grad(set_to_none=True)  # discard unused graph
             del loss
         return e
+
+    def observe_batch(self, texts, max_length=2048, prompt_weight=None,
+                      key_texts=None, key_weight=4.0):
+        """Mini-batch TTT (TTT-E2E: b>1 stabilizes test-time training).
+
+        Accumulates gradients over all `texts`, then takes ONE optimizer
+        step (and one decay). Sequential per-doc steps let later docs
+        overwrite earlier ones inside an epoch; a batched step descends the
+        AVERAGE loss — the optimizer-level form of "interleave or lose it".
+
+        Returns the list of per-doc pre-update NLLs.
+        """
+        import torch
+        with self.learn_lock:
+            self.opt.zero_grad()
+            surprises = []
+            n = 0
+            for i, text in enumerate(texts):
+                enc = self.tok(text, return_tensors="pt", truncation=True,
+                               max_length=max_length,
+                               return_offsets_mapping=True)
+                ids = enc.input_ids.to(self.device)
+                if ids.shape[1] < 2:
+                    surprises.append(None)
+                    continue
+                if prompt_weight is not None and prompt_weight >= 1.0:
+                    weights = None
+                else:
+                    weights = self._assistant_labels(
+                        ids, enc.offset_mapping[0], text,
+                        prompt_weight=prompt_weight)
+                kt = key_texts[i] if key_texts else None
+                if kt:
+                    weights = self._key_weights(ids, enc.offset_mapping[0],
+                                                text, kt, key_weight, weights)
+                loss = self._nll(ids, weights) / max(len(texts), 1)
+                loss.backward()
+                surprises.append(loss.item() * len(texts))
+                n += 1
+            if n == 0:
+                self.opt.zero_grad(set_to_none=True)
+                return surprises
+            torch.nn.utils.clip_grad_norm_(
+                [self.head.A, self.head.B, self.head.alpha], 1.0)
+            self.opt.step()
+            with torch.no_grad():
+                self.last_decay = self.decay
+                self.head.B.mul_(self.decay)
+                if self.max_B_norm is not None:
+                    nb = self.head.B.norm()
+                    if nb > self.max_B_norm:
+                        self.head.B.mul_(self.max_B_norm / nb)
+            self.last_fired = True
+            return surprises
 
     # ---------------- chat ----------------
     def chat(self, user_msg, max_new_tokens=512, temperature=0.7,
@@ -392,10 +506,19 @@ def _plastic_head_cls():
     import torch.nn as nn
 
     class PlasticHead(nn.Module):
-        """Fast LoRA on lm_head: y = base(x) + scale*(x A)B. Only A,B change.
+        """Fast LoRA on lm_head with a learned per-channel gate:
 
-        A/B live in fp32 even when the base is bf16 — small SGD steps
-        would otherwise round to zero."""
+            y = base(x) + 2*scale*tanh(alpha) ⊙ (x A) B
+
+        alpha ∈ R^{d_out} is initialized at atanh(0.5) so the effective
+        multiplier at init is exactly `scale` (behavior-preserving — a
+        RoboTTT-style ~0 init would silence B's gradients and kill
+        learning). Per-channel range: [0, 2*scale]. alpha is SLOW state:
+        it carries no facts (delta==0 whenever B==0), so reset() stays a
+        provable off-switch without touching it.
+
+        A/B/alpha live in fp32 even when the base is bf16 — small SGD
+        steps would otherwise round to zero."""
         def __init__(self, base, r=16, scale=2.0):
             super().__init__()
             self.base = base
@@ -406,12 +529,17 @@ def _plastic_head_cls():
                                               dtype=torch.float32) * 0.01)
             self.B = nn.Parameter(torch.zeros(r, base.out_features, device=dev,
                                               dtype=torch.float32))
+            # atanh(0.5) -> tanh(alpha)=0.5 -> effective mult = scale at init
+            self.alpha = nn.Parameter(torch.full(
+                (base.out_features,), 0.5493061443340549, device=dev,
+                dtype=torch.float32))
             self.scale = scale
 
         def forward(self, x):
             y = self.base(x)
             delta = (x.to(torch.float32) @ self.A) @ self.B
-            return y + self.scale * delta.to(y.dtype)
+            gate = (2.0 * self.scale) * torch.tanh(self.alpha)
+            return y + (delta * gate).to(y.dtype)
 
     return PlasticHead
 

@@ -180,6 +180,8 @@ The stability–plasticity dial, measured (OOD baseline NLL 4.23):
 | `.save_fast_weights(path)` / `.load_fast_weights(path)` | persist or restore acquired experience |
 | `.merge_experience(paths)` | compose agents' experience files. **Caveat (measured):** the delta arithmetic is exact and conflict detection works, but merged fact bindings from same-format experience can fail to transfer — the merged deltas are parameter-orthogonal yet the composed model may babble. Verify recall after merging; prefer `strategy="relearn"` + re-teaching for critical lessons |
 | `.reset()` | the off-switch — exactly the base model again |
+| `SLM(..., meta_state="artifacts/meta_state.pt")` | load a meta-learned plastic init (RoboTTT-style learned-to-learn W₀, from `scripts/meta_train.py`): binds facts in fewer rounds at lower retention cost |
+| `.teach(prompt, response, key="TOKEN")` | KVB-style focus: key tokens carry 4x loss — `bind()` auto-detects and passes the key |
 | `.surprise_log` | (turn, NLL) history — watch it learn |
 | `.audit_log` | per-update content hash + provenance — attribute any poisoned update |
 | `slm_tools(model)` | the whole API above as Strands `@tool` functions — agents tune their own weights |
@@ -244,6 +246,7 @@ uv pip install "strands-slm[training,tools]"
 python scripts/build_corpus.py       # strands-agents repos -> corpus.jsonl
 python scripts/train_lora.py --steps 1200 --bs 2 --accum 4 --lr 1e-4
 python scripts/eval_strands.py       # base vs tuned probes
+python scripts/meta_train.py         # meta-learn the plastic init W0 (FOMAML, ~3 min on 0.6B)
 ```
 
 Private HF repos need `HF_TOKEN` in the environment, or pass `token=`.

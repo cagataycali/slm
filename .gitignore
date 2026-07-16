@@ -12,3 +12,4 @@ scripts/corpus.jsonl
 slm/_version.py
 .autonomous/
 papers/
+uv.lock
